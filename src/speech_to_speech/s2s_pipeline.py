@@ -1,3 +1,23 @@
+
+# ================= 动态修复 torchaudio.backend 缺失补丁 =================
+import sys
+import types
+import torchaudio
+
+if not hasattr(torchaudio, "backend"):
+    # 1. 动态创建一个假的 backend 模块并挂载
+    backend_mod = types.ModuleType("backend")
+    torchaudio.backend = backend_mod
+    sys.modules["torchaudio.backend"] = backend_mod
+    
+    # 2. 动态创建一个假的 common 模块并挂载
+    common_mod = types.ModuleType("common")
+    # 将新版正确的 AudioMetaData 塞给这个假的 common 模块，使其能被正常 import
+    common_mod.AudioMetaData = getattr(torchaudio, "AudioMetaData", None)
+    torchaudio.backend.common = common_mod
+    sys.modules["torchaudio.backend.common"] = common_mod
+# =====================================================================
+
 import argparse
 import json
 import logging
