@@ -44,7 +44,7 @@ DEFAULT_MLX_STREAMING_CHUNK_SIZE = 4
 DEFAULT_QWEN3_TTS_MAX_NEW_TOKENS = 1536
 MIN_QWEN3_TTS_UTTERANCE_TOKENS = 360
 VALID_MLX_QUANTIZATION_SUFFIXES = ("bf16", "4bit", "6bit", "8bit")
-VALID_FASTER_BACKENDS = ("ggml", "torch")
+VALID_FASTER_BACKENDS = ("torch", "ggml")
 MLX_STREAMING_TOKENS_PER_SECOND = 12.5
 PIPELINE_SR = 16000
 ESTIMATED_QWEN3_WORDS_PER_SECOND = 2.6
@@ -97,7 +97,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         device: str = "cuda",
         dtype: str | torch.dtype = "auto",
         attn_implementation: str = "eager",
-        backend: str = "ggml",
+        backend: str = "torch",
         ref_audio: str | Path | None = None,
         ref_text: str = DEFAULT_REF_TEXT,
         language: str = "auto",
@@ -119,7 +119,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.should_listen = should_listen
         self.requested_device = device
         self.ref_audio = ref_audio
-        self.ref_text = ref_text
+        self.ref_text = self._resolve_ref_text(ref_text)
         self.language = self._normalize_language(language)
         self.speaker = speaker
         self.instruct = instruct
@@ -202,7 +202,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 "faster-qwen3-tts is required for Qwen3 TTS on non-macOS platforms. "
                 "Install with: pip install 'faster-qwen3-tts[ggml]'"
             ) from e
-
+        print("Loading Qwen3-TTS model via faster-qwen3-tts...",backend)
         self.model = FasterQwen3TTS.from_pretrained(
             model_name,
             device=self.device,
@@ -240,7 +240,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         logger.info("MLX Audio Qwen3-TTS model loaded")
 
     def _normalize_faster_backend(self, backend: Any) -> str:
-        value = str(backend or "ggml").strip().lower()
+        value = str(backend or "torch").strip().lower()
         if value not in VALID_FASTER_BACKENDS:
             raise ValueError(
                 f"Unsupported qwen3_tts_backend value {backend!r}. Supported values: {', '.join(VALID_FASTER_BACKENDS)}"
@@ -305,6 +305,18 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         if self.backend == "mlx":
             return DEFAULT_MLX_STREAMING_CHUNK_SIZE
         return DEFAULT_FASTER_STREAMING_CHUNK_SIZE
+
+    @staticmethod
+    def _resolve_ref_text(ref_text: str) -> str:
+        """Resolve ref_text: if it points to an existing file, read its content."""
+        candidate = Path(ref_text)
+        if candidate.is_file():
+            text = candidate.read_text(encoding="utf-8").strip()
+            if text:
+                logger.info("Loaded ref_text from %s (%d chars)", candidate, len(text))
+                return text
+            logger.warning("ref_text file %s is empty; using original string", candidate)
+        return ref_text
 
     def _normalize_language(self, language: str | None) -> str:
         if language is None:

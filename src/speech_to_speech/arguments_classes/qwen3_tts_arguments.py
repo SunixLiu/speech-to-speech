@@ -29,7 +29,7 @@ class Qwen3TTSHandlerArguments:
         },
     )
     qwen3_tts_backend: Literal["ggml", "torch"] = field(
-        default="ggml",
+        default="torch",
         metadata={
             "help": "faster-qwen3-tts backend on non-macOS platforms. Options: 'ggml' or 'torch'. Default is 'ggml'. On Apple Silicon, mlx-audio is selected automatically and this option is ignored."
         },
@@ -42,7 +42,7 @@ class Qwen3TTSHandlerArguments:
     )
     qwen3_tts_ref_text: str = field(
         default="I'm confused why some people have super short timelines, yet at the same time are bullish on scaling up reinforcement learning atop LLMs. If we're actually close to a human-like learner, then this whole approach of training on verifiable outcomes.",
-        metadata={"help": "Transcription of the reference audio for voice cloning."},
+        metadata={"help": "Transcription of the reference audio for voice cloning. Can be a plain text string or a file path; if a valid file path is given, the content is read from the file."},
     )
     qwen3_tts_speaker: Optional[str] = field(
         default="Aiden",
