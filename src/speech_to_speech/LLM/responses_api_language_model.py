@@ -18,6 +18,7 @@ from openai.types.responses import (
 )
 
 from speech_to_speech.LLM.base_openai_compatible_language_model import (
+    WARMUP_MAX_RETRIES,
     AssistantMessage,
     BaseOpenAICompatibleHandler,
     ProviderEvent,
@@ -26,6 +27,13 @@ from speech_to_speech.LLM.base_openai_compatible_language_model import (
     Usage,
 )
 from speech_to_speech.LLM.chat import Chat
+from speech_to_speech.LLM.chat_completions_language_model import (
+    _build_chat_optional_kwargs,
+    _chat_messages,
+    _iter_chat_response_events,
+    _iter_chat_stream_events,
+    _request_chat_completions,
+)
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn
 from speech_to_speech.utils.utils import _generate_id
 
@@ -38,7 +46,7 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
     def warmup(self) -> None:
         logger.info(f"Warming up {self.__class__.__name__}")
         start = time.time()
-        self.client.responses.create(
+        self.client.with_options(max_retries=WARMUP_MAX_RETRIES).responses.create(
             model=self.model_name,
             input=[
                 {
@@ -79,6 +87,42 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
             return response.output_text
 
         return generate
+
+    def _build_audio_optional_kwargs(
+        self,
+        response: Any,
+        req_tools: Any,
+        req_tool_choice: Any,
+    ) -> dict[str, Any]:
+        kwargs = _build_chat_optional_kwargs(req_tools, req_tool_choice)
+        max_tokens = getattr(response, "max_output_tokens", None) if response is not None else None
+        kwargs.setdefault("max_tokens", max_tokens or self.audio_max_tokens)
+        kwargs.setdefault("temperature", self.audio_temperature)
+        return kwargs
+
+    def _serialize_audio(self, active_chat: Chat) -> list[dict[str, Any]]:
+        return _chat_messages(active_chat, audio_content_type=self.audio_content_type)
+
+    def _request_audio(
+        self,
+        api_input: list[dict[str, Any]],
+        optional_kwargs: dict[str, Any],
+    ) -> Any:
+        return _request_chat_completions(
+            client=self.client,
+            model_name=self.model_name,
+            messages=api_input,
+            stream=self.stream,
+            extra_body=self._extra_body,
+            timeout=self.request_timeout,
+            optional_kwargs=optional_kwargs,
+        )
+
+    def _iter_audio_events(self, api_response: Any) -> Iterator[ProviderEvent]:
+        if self.stream:
+            yield from _iter_chat_stream_events(api_response)
+        else:
+            yield from _iter_chat_response_events(api_response)
 
     # ── base hooks ──────────────────────────────────────────────────────────--
 
