@@ -39,6 +39,7 @@ from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn, build_comp
 from speech_to_speech.LLM.text_prompt import build_text_system_prompt
 from speech_to_speech.LLM.utils import remove_unspeechable, resolve_auto_language
 from speech_to_speech.LLM.voice_prompt import build_voice_system_prompt
+from speech_to_speech.TTS.voice_tools import SWITCH_VOICE_TOOL, LIST_VOICES_TOOL
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import LLMIn, LLMOut
 from speech_to_speech.pipeline.messages import (
@@ -666,6 +667,22 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     turn_id=turn.turn_id,
                     turn_revision=turn.turn_revision,
                 )
+
+            # Execute voice tool calls server-side if applicable
+            voice_tool_executed = False
+            if state.tools:
+                voice_tool_executed = self._handle_voice_tool_calls(
+                    state.tools, original_chat, turn.runtime_config, turn.response,
+                )
+
+            # If voice tool was executed, trigger follow-up generation
+            if voice_tool_executed and not self._generation_is_stale(turn.gen) and self._turn_output_allowed(turn.turn_id, turn.turn_revision):
+                logger.info("Voice tool executed; triggering follow-up generation")
+                try:
+                    yield from self._generate(original_chat, original_chat, turn, optional_kwargs)
+                except Exception as e:
+                    logger.warning("Follow-up generation after voice tool failed: %s", e)
+
             yield EndOfResponse(
                 turn_id=turn.turn_id,
                 turn_revision=turn.turn_revision,

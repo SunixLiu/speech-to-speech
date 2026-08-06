@@ -46,6 +46,7 @@ from speech_to_speech.LLM.tool_call.function_tool import FunctionTool
 from speech_to_speech.LLM.tool_call.tool_prompt import END_CODE, ENTER_CODE, build_block_regex, build_tool_system_prompt
 from speech_to_speech.LLM.utils import image_url_to_pil, remove_unspeechable, resolve_auto_language
 from speech_to_speech.LLM.voice_prompt import build_voice_system_prompt
+from speech_to_speech.TTS.voice_tools import SWITCH_VOICE_TOOL, LIST_VOICES_TOOL
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import LLMIn, LLMOut
 from speech_to_speech.pipeline.messages import (
@@ -577,7 +578,35 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             logger.debug("Clean text: %s", ctx.generated_text)
             logger.info(f"Tools: {ctx.tools}")
 
-            if turn_output_allowed and ctx.printable_text.strip():
+            # Execute voice tool calls server-side if applicable
+            voice_tool_executed = False
+            if commit_allowed and ctx.tools:
+                voice_tool_executed = self._handle_voice_tool_calls(
+                    ctx.tools, original_chat, runtime_config, response,
+                )
+
+            # If voice tool was executed, trigger follow-up generation
+            if voice_tool_executed and turn_output_allowed:
+                logger.info("Voice tool executed; triggering follow-up generation")
+                try:
+                    yield from self._generate(
+                        original_chat, language_code, gen, ctx, runtime_config, response,
+                    )
+                    if ctx.printable_text.strip():
+                        yield LLMResponseChunk(
+                            text=ctx.printable_text.strip(),
+                            language_code=language_code,
+                            runtime_config=runtime_config,
+                            response=response,
+                            turn_id=ctx.turn_id,
+                            turn_revision=ctx.turn_revision,
+                            speech_stopped_at_s=ctx.speech_stopped_at_s,
+                            cancel_generation=ctx.cancel_generation,
+                        )
+                except Exception as e:
+                    logger.warning("Follow-up generation after voice tool failed: %s", e)
+
+            if not voice_tool_executed and turn_output_allowed and ctx.printable_text.strip():
                 yield LLMResponseChunk(
                     text=ctx.printable_text.strip(),
                     language_code=language_code,

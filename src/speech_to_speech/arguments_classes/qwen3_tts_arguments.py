@@ -134,3 +134,12 @@ class Qwen3TTSHandlerArguments:
             "help": "Audio chunk size in samples for streaming output. Must match LocalAudioStreamer blocksize. Default is 512."
         },
     )
+    qwen3_tts_voice_registry_config: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to voice registry YAML config for dynamic voice switching. "
+                   "When set, the TTS handler loads pre-extracted voice profiles and "
+                   "switches to the default voice on startup. Use switch_voice() or "
+                   "session voice override to change voices at runtime."
+        },
+    )

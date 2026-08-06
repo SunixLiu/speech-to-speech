@@ -49,6 +49,18 @@ class SessionHandler(RealtimeBaseHandler):
             cfg.session = s
         else:
             cfg.apply_session_update(s)
+
+        # Re-inject voice tools if the client overwrote session.tools
+        if self._service._voice_tool_executor is not None:
+            from speech_to_speech.TTS.voice_tools import build_voice_tools
+
+            client_tools = s.model_fields_set & {"tools"}
+            if client_tools:
+                voice_tools = build_voice_tools()
+                existing = cfg.session.tools or []
+                cfg.session.tools = existing + voice_tools
+                logger.info("Re-injected %d voice tool(s) after session.update", len(voice_tools))
+
         logger.info("Session configuration updated")
         return None
 

@@ -107,6 +107,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         ref_spk: str | Path | None = None,
         ref_rvq: str | Path | None = None,
         ref_text: str = DEFAULT_REF_TEXT,
+        voice_registry_config: str | Path | None = None,
         language: str = "auto",
         speaker: Optional[str] = "Aiden",
         instruct: Optional[str] = None,
@@ -128,7 +129,21 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.ref_audio = ref_audio
         self.ref_spk = self._normalize_optional_path(ref_spk)
         self.ref_rvq = self._normalize_optional_path(ref_rvq)
-        self.ref_text = ref_text
+        self.ref_text = self._resolve_ref_text(ref_text)
+        self._runtime_config = None
+        # Voice registry for dynamic switching
+        self.voice_registry_config = voice_registry_config
+        self.voice_registry: Any = None
+        self._current_voice_name: str | None = None
+        # Cached voice reference for GGML backend (ref_spk, ref_rvq paths)
+        self._cached_ref_spk: str | None = None
+        self._cached_ref_rvq: str | None = None
+        # Cached voice reference for Torch backend (ref_spk_emb, ref_codes)
+        self._cached_ref_spk_emb: Any = None
+        self._cached_ref_codes: Any = None
+        # Load voice registry if config provided
+        if voice_registry_config is not None:
+            self._load_voice_registry(voice_registry_config)
         self.language = self._normalize_language(language)
         self.speaker = speaker
         self.instruct = instruct
@@ -379,6 +394,18 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             return DEFAULT_MLX_STREAMING_CHUNK_SIZE
         return DEFAULT_FASTER_STREAMING_CHUNK_SIZE
 
+    @staticmethod
+    def _resolve_ref_text(ref_text: str) -> str:
+        """Resolve ref_text: if it points to an existing file, read its content."""
+        candidate = Path(ref_text)
+        if candidate.is_file():
+            text = candidate.read_text(encoding="utf-8").strip()
+            if text:
+                logger.info("Loaded ref_text from %s (%d chars)", candidate, len(text))
+                return text
+            logger.warning("ref_text file %s is empty; using original string", candidate)
+        return ref_text
+
     def _normalize_language(self, language: str | None) -> str:
         if language is None:
             return "auto"
@@ -427,7 +454,8 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         return None
 
     def _has_voice_clone_reference(self) -> bool:
-        return bool(self.ref_audio or getattr(self, "ref_spk", None))
+        has_cached_voice = self._cached_ref_spk is not None or self._cached_ref_spk_emb is not None
+        return bool(self.ref_audio or getattr(self, "ref_spk", None) or has_cached_voice)
 
     def _clear_cached_voice_reference(self) -> None:
         self.ref_spk = None
@@ -530,15 +558,107 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             self._clear_cached_voice_reference()
             return
 
+        # Check voice registry for named voice match
+        if self.voice_registry is not None:
+            profile = self.voice_registry.get(session_voice)
+            if profile is None:
+                # Try case-insensitive match
+                for name, p in self.voice_registry.voices.items():
+                    if p.name.lower() == session_voice.lower() or p.display_name.lower() == session_voice.lower():
+                        profile = p
+                        break
+            if profile is not None:
+                self._apply_voice_profile(profile)
+                return
+
         if self._resolve_audio_path(session_voice) is not None:
             self.ref_audio = session_voice
             self._clear_cached_voice_reference()
             return
 
+        # Fallback to default voice from registry if available
+        if self.voice_registry is not None:
+            default = self.voice_registry.get_default()
+            if default:
+                logger.info("Falling back to default voice: %s (%s)", default.display_name, default.name)
+                self._apply_voice_profile(default)
+                return
+
         logger.warning(
             "Ignoring Qwen3-TTS session voice override because it is not an audio file path: %r",
             session_voice,
         )
+
+    def _load_voice_registry(self, config_path: str | Path) -> None:
+        """Load voice registry from config file."""
+        from speech_to_speech.TTS.voice_registry import load_registry
+
+        self.voice_registry = load_registry(config_path)
+        default = self.voice_registry.get_default()
+        if default:
+            self._apply_voice_profile(default)
+            logger.info("Loaded default voice: %s (%s)", default.display_name, default.name)
+
+    def _apply_voice_profile(self, profile) -> None:
+        """Apply a voice profile, setting the appropriate cache references."""
+        self._current_voice_name = profile.name
+        logger.info("Switching voice to: %s (%s)", profile.display_name, profile.name)
+
+        if profile.is_ggml:
+            self._cached_ref_spk = profile.spk_file
+            self._cached_ref_rvq = profile.rvq_file
+            self._cached_ref_spk_emb = None
+            self._cached_ref_codes = None
+            self.ref_audio = None
+            self.ref_text = profile.ref_text or self.ref_text
+        elif profile.is_torch:
+            self._cached_ref_spk = None
+            self._cached_ref_rvq = None
+            self.ref_audio = None
+            self.ref_text = profile.ref_text or self.ref_text
+            data = np.load(profile.npz_file, allow_pickle=True)
+            self._cached_ref_spk_emb = data["ref_spk_embedding"]
+            codes_key = "ref_codes"
+            self._cached_ref_codes = data[codes_key] if codes_key in data else None
+
+    def switch_voice(self, voice_name: str) -> str:
+        """Switch to a registered voice by name. Returns success/error message."""
+        if self.voice_registry is None:
+            logger.warning("No voice registry loaded")
+            return "Error: no voice registry loaded"
+
+        profile = self.voice_registry.get(voice_name)
+        if profile is None:
+            available = self.voice_registry.list_names()
+            logger.warning("Voice %r not found. Available: %s", voice_name, ", ".join(available))
+            return f"Error: voice '{voice_name}' not found. Available: {', '.join(available)}"
+
+        self._apply_voice_profile(profile)
+        # Also update session config so _apply_session_voice_override doesn't override it back
+        if self._runtime_config is not None and self._runtime_config.session.audio is not None:
+            self._runtime_config.session.audio.output.voice = profile.name
+        return f"Switched to {profile.display_name} ({profile.name})"
+
+    def get_current_voice_name(self) -> str | None:
+        """Return the current voice name."""
+        return self._current_voice_name
+
+    def list_available_voices(self) -> list[dict]:
+        """Return list of available voice info dicts."""
+        if self.voice_registry is None:
+            return []
+        result = []
+        for v in self.voice_registry.list_voices():
+            info = {
+                "name": v.name,
+                "display_name": v.display_name,
+                "description": v.description,
+                "tags": v.tags,
+                "backend": v.backend,
+                "is_current": v.name == self._current_voice_name,
+            }
+            result.append(info)
+        return result
 
     def warmup(self) -> None:
         logger.info(f"Warming up {self.__class__.__name__}")
@@ -793,6 +913,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             speculative_turns.commit(tts_input.turn_id, tts_input.turn_revision)
 
         runtime_config = tts_input.runtime_config
+        self._runtime_config = runtime_config
         response = tts_input.response
 
         coalesced_text, _language_code, _saw_end_of_response = self._coalesce_pending_tts_input(tts_input)
@@ -887,20 +1008,49 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             )
             return
 
+        # Build kwargs for generate_voice_clone_streaming
+        gen_kwargs: dict[str, Any] = {
+            "text": text,
+            "language": self.language,
+            "ref_text": self.ref_text,
+            "xvec_only": self.xvec_only,
+            "chunk_size": self.streaming_chunk_size,
+            "max_new_tokens": utterance_max_new_tokens,
+            "parity_mode": self.parity_mode,
+            "non_streaming_mode": self.non_streaming_mode,
+        }
+
+        # Use cached voice reference if available (dynamic voice switching)
+        if self._cached_ref_spk is not None:
+            # GGML backend: use pre-extracted .spk/.rvq files
+            gen_kwargs["ref_spk"] = self._cached_ref_spk
+            if self._cached_ref_rvq is not None:
+                gen_kwargs["ref_rvq"] = self._cached_ref_rvq
+            gen_kwargs["ref_audio"] = None
+            # Use profile ref_text if available (important for ICL mode)
+            if self.voice_registry and self._current_voice_name:
+                profile = self.voice_registry.get(self._current_voice_name)
+                if profile and profile.ref_text:
+                    gen_kwargs["ref_text"] = profile.ref_text
+            logger.debug("Using cached GGML voice ref: %s", self._cached_ref_spk)
+        elif self._cached_ref_spk_emb is not None:
+            # Torch backend: use pre-extracted numpy arrays
+            import torch
+            spk_emb_tensor = torch.from_numpy(self._cached_ref_spk_emb)
+            voice_clone_prompt = {
+                "ref_spk_embedding": [spk_emb_tensor],
+                "x_vector_only_mode": [True],
+                "icl_mode": [False],
+            }
+            gen_kwargs["voice_clone_prompt"] = voice_clone_prompt
+            gen_kwargs["ref_audio"] = None
+            logger.debug("Using cached Torch voice ref (xvec-only)")
+        else:
+            # Fallback to ref_audio path
+            gen_kwargs["ref_audio"] = self.ref_audio
+
         yield from self._stream(
-            self.model.generate_voice_clone_streaming(
-                text=text,
-                language=self.language,
-                ref_audio=self.ref_audio,
-                ref_spk=getattr(self, "ref_spk", None),
-                ref_rvq=getattr(self, "ref_rvq", None),
-                ref_text=self.ref_text,
-                xvec_only=self.xvec_only,
-                chunk_size=self.streaming_chunk_size,
-                max_new_tokens=utterance_max_new_tokens,
-                parity_mode=self.parity_mode,
-                non_streaming_mode=self.non_streaming_mode,
-            ),
+            self.model.generate_voice_clone_streaming(**gen_kwargs),
             label="voice_clone_parity" if self.parity_mode else "voice_clone",
         )
 
@@ -968,6 +1118,16 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.ref_audio = self._initial_ref_audio
         self.ref_spk = self._initial_ref_spk
         self.ref_rvq = self._initial_ref_rvq
+        # Reset voice cache state
+        self._cached_ref_spk = None
+        self._cached_ref_rvq = None
+        self._cached_ref_spk_emb = None
+        self._cached_ref_codes = None
+        # Re-apply default voice if registry loaded
+        if self.voice_registry is not None:
+            default = self.voice_registry.get_default()
+            if default:
+                self._apply_voice_profile(default)
         logger.debug("Qwen3-TTS session state reset")
 
     def cleanup(self) -> None:

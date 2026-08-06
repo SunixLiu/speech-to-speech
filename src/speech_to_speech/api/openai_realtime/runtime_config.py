@@ -3,8 +3,12 @@ from openai.types.realtime.realtime_audio_config import RealtimeAudioConfig
 from openai.types.realtime.realtime_audio_config_input import RealtimeAudioConfigInput
 from openai.types.realtime.realtime_audio_config_output import RealtimeAudioConfigOutput
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from typing import TYPE_CHECKING, Any, Optional
 
 from speech_to_speech.LLM.chat import Chat
+
+if TYPE_CHECKING:
+    from speech_to_speech.TTS.voice_tools import VoiceToolExecutor
 
 
 def _apply_update(current: BaseModel, update: BaseModel) -> None:
@@ -41,6 +45,10 @@ class RuntimeConfig(BaseModel):
     session: RealtimeSessionCreateRequest = Field(
         default_factory=lambda: RealtimeSessionCreateRequest(type="realtime"),
         validate_default=True,
+    )
+    voice_tool_executor: Optional[Any] = Field(
+        default=None,
+        description="Server-side executor for voice tool calls.",
     )
 
     @field_validator("session", mode="after")

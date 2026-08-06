@@ -86,6 +86,7 @@ from speech_to_speech.pipeline.queue_types import (
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.STT.transcription_notifier import TranscriptionNotifier
 from speech_to_speech.utils.thread_manager import ThreadManager
+from speech_to_speech.TTS.voice_tools import VoiceToolExecutor, build_voice_tools
 from speech_to_speech.VAD.vad_handler import VADHandler
 
 # Ensure that the necessary NLTK resources are available
@@ -527,6 +528,52 @@ def _build_pipeline_handlers(
     return [vad, *speech_input_handlers, lm, lm_processor, tts]
 
 
+def _setup_voice_tools_on_config(
+    runtime_config,
+    qwen3_tts_kwargs,
+    tts_handler=None,
+):
+    """Set up voice tools on a RuntimeConfig if voice registry is configured.
+
+    Returns the VoiceToolExecutor (or None if not configured).
+    The executor is attached to runtime_config.voice_tool_executor so the
+    LLM handler can find and execute voice tool calls server-side.
+    """
+    registry_path = getattr(qwen3_tts_kwargs, "voice_registry_config", None)
+    logger.info("registry_path from qwen3_tts_kwargs: %s", registry_path)
+    if not registry_path:
+        return None
+
+    from speech_to_speech.TTS.voice_registry import load_registry
+
+    registry = load_registry(registry_path)
+
+    # Build tools and inject into session config
+    voice_tools = build_voice_tools()
+    existing_tools = runtime_config.session.tools or []
+    runtime_config.session.tools = existing_tools + voice_tools
+    logger.info("Injected %d voice tool(s) into session config", len(voice_tools))
+
+    # Create executor and attach to runtime config
+    executor = VoiceToolExecutor(registry=registry)
+
+    # Wire callback to TTS handler if available
+    if tts_handler is not None:
+        def _voice_callback(action, args):
+            if action == "__get_current__":
+                return getattr(tts_handler, "get_current_voice_name", lambda: "unknown")()
+            elif action == "switch":
+                name = args.get("name", "")
+                result = tts_handler.switch_voice(name)
+                return result
+            return "Unknown action"
+        executor.set_switch_callback(_voice_callback)
+        logger.info("Voice tool executor wired to TTS handler")
+
+    runtime_config.voice_tool_executor = executor
+    return executor
+
+
 def _build_realtime_pipeline_unit(
     *,
     index: int,
@@ -601,11 +648,17 @@ def _build_realtime_pipeline_unit(
     else:
         chat_size = vars(lm_kw).get("chat_size", 10)
 
+    # Set up voice tool executor for realtime mode
+    # Create a temporary RuntimeConfig just to load registry and build tools/executor
+    temp_rc = RuntimeConfig(chat=Chat(chat_size))
+    voice_executor = _setup_voice_tools_on_config(temp_rc, qwen3_tts_kw)
+
     service = RealtimeService(
         text_prompt_queue=text_prompt_queue,
         should_listen=should_listen,
         chat_size=chat_size,
         speculative_turns=speculative_turns,
+        voice_tool_executor=voice_executor,
     )
 
     if module_kwargs.enable_live_transcription:
@@ -643,6 +696,21 @@ def _build_realtime_pipeline_unit(
         qwen3_tts_handler_kwargs=qwen3_tts_kw,
         speculative_turns=speculative_turns,
     )
+    # Wire TTS handler to voice executor after handlers are built
+    if voice_executor is not None:
+        tts_handler = handlers[-1] if handlers else None
+        if tts_handler is not None:
+            def _voice_callback(action, args):
+                if action == "__get_current__":
+                    return getattr(tts_handler, "get_current_voice_name", lambda: "unknown")()
+                elif action == "switch":
+                    name = args.get("name", "")
+                    result = tts_handler.switch_voice(name)
+                    return result
+                return "Unknown action"
+            voice_executor.set_switch_callback(_voice_callback)
+            logger.info("Voice tool executor wired to TTS handler (realtime)")
+
     for h in handlers:
         h.pipeline_index = index
 
@@ -797,6 +865,7 @@ def build_pipeline(
             session=RealtimeSessionCreateRequest(
                 type="realtime",
                 instructions=_lm_vars.get("init_chat_prompt"),
+                tool_choice="auto",
             ),
         ),
     }
@@ -828,6 +897,12 @@ def build_pipeline(
         kokoro_tts_handler_kwargs=kokoro_tts_handler_kwargs,
         qwen3_tts_handler_kwargs=qwen3_tts_handler_kwargs,
     )
+
+    # Set up voice tools on the RuntimeConfig now that TTS handler is built
+    runtime_config = transcription_notifier_setup.get("runtime_config")
+    if runtime_config is not None:
+        tts_handler = pipeline_handlers[-1] if pipeline_handlers else None
+        _setup_voice_tools_on_config(runtime_config, qwen3_tts_handler_kwargs, tts_handler)
 
     return ThreadManager([*comms_handlers, *pipeline_handlers])
 

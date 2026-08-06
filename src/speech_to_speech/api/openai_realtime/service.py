@@ -4,6 +4,8 @@ from queue import Queue
 from threading import Event as ThreadingEvent
 from typing import Any, Callable, Literal, Optional, TypeVar, Union
 
+from speech_to_speech.TTS.voice_tools import build_voice_tools
+
 from openai.types.realtime import (
     ConversationItem,
     ConversationItemCreatedEvent,
@@ -205,11 +207,13 @@ class RealtimeService:
         should_listen: ThreadingEvent | None = None,
         chat_size: int = 10,
         speculative_turns: SpeculativeTurnTracker | None = None,
+        voice_tool_executor=None,
     ) -> None:
         self.text_prompt_queue = text_prompt_queue
         self.should_listen = should_listen
         self._chat_size = chat_size
         self.speculative_turns = speculative_turns
+        self._voice_tool_executor = voice_tool_executor
         self._conns: dict[str, ConnState] = {}
         self.total_usage = GlobalUsageMetrics()
 
@@ -234,7 +238,16 @@ class RealtimeService:
         """Register a new connection and return its session_id."""
         if self.speculative_turns:
             self.speculative_turns.reset()
-        state = ConnState(runtime_config=RuntimeConfig(chat=Chat(self._chat_size)))
+        rc = RuntimeConfig(chat=Chat(self._chat_size))
+        if self._voice_tool_executor is not None:
+            rc.voice_tool_executor = self._voice_tool_executor
+            # Also inject voice tools into session config for this connection
+            voice_tools = build_voice_tools()
+            existing_tools = rc.session.tools or []
+            rc.session.tools = existing_tools + voice_tools
+            logger.info("Injected %d voice tool(s) into session config for new connection", len(voice_tools))
+        rc.session.tool_choice = "auto"
+        state = ConnState(runtime_config=rc)
         self._conns[state.session_id] = state
         self.total_usage.connections += 1
         return state.session_id

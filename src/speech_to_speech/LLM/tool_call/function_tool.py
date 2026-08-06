@@ -6,6 +6,12 @@ from speech_to_speech.LLM.tool_call.signature_from_schema import signature_from_
 
 
 class FunctionTool(RealtimeFunctionTool):
+    # Explicitly set type to ensure it is never None/dropped during serialization.
+    # RealtimeFunctionTool defines type: Optional[Literal["function"]] = None,
+    # and the OpenAI SDK serializes with exclude_none=True, which drops the field.
+    # Local LLM servers (llama.cpp/lmstudio) then see type='' and reject the tool.
+    type: str = "function"
+
     def to_code_prompt(self, include_args_doc: bool = True) -> str:
         """Generate a code-style prompt string for this function tool.
 

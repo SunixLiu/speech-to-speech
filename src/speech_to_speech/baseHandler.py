@@ -2,7 +2,9 @@ from __future__ import annotations
 
 # ruff: noqa: I001
 
+import json
 import logging
+import re
 from queue import Empty, Queue
 from threading import Event
 from time import perf_counter
@@ -153,6 +155,78 @@ class BaseHandler(Generic[InT, OutT]):
 
     def should_log_timing(self, output: OutT) -> bool:
         return self.last_time > self.min_time_to_debug
+
+    def _handle_voice_tool_calls(
+        self,
+        tools,
+        original_chat,
+        runtime_config,
+        response=None,
+    ) -> bool:
+        """Execute voice tool calls server-side and inject results into chat.
+
+        Returns True if any voice tool was executed."""
+        if not runtime_config or not getattr(runtime_config, "voice_tool_executor", None):
+            return False
+
+        executor = runtime_config.voice_tool_executor
+        voice_tool_names = {"switch_voice", "list_voices"}
+        executed = False
+
+        for tool_call in tools:
+            if getattr(tool_call, "name", None) not in voice_tool_names:
+                continue
+
+            try:
+                args = json.loads(tool_call.arguments) if getattr(tool_call, "arguments", None) else {}
+            except Exception:
+                args = {}
+
+            try:
+                result = executor.execute(tool_call.name, args)
+                # Update session config voice so _apply_session_voice_override doesn't override it back
+                if tool_call.name == "switch_voice" and result.startswith("Switched to"):
+                    match = re.search(r"Switched to [^)]+ \(([^)]+)\)", result)
+                    if match and runtime_config is not None and runtime_config.session.audio is not None:
+                        runtime_config.session.audio.output.voice = match.group(1)
+            except Exception as e:
+                result = "Error executing " + tool_call.name + ": " + str(e)
+                logger.warning("Voice tool execution failed: " + str(e), exc_info=True)
+
+            from openai.types.realtime import RealtimeConversationItemFunctionCallOutput
+
+            output_item = RealtimeConversationItemFunctionCallOutput(
+                call_id=tool_call.call_id,
+                output=result,
+                type="function_call_output",
+                id=tool_call.id,
+                status="completed",
+            )
+            original_chat.append_tool_output(tool_call.call_id, output_item)
+
+            # Remove any re-injected function_call from buffer to prevent
+            # it from contaminating the follow-up generation.
+            from openai.types.realtime import RealtimeConversationItemFunctionCall
+
+            for item in list(original_chat.buffer):
+                if (
+                    isinstance(item, RealtimeConversationItemFunctionCall)
+                    and item.call_id == tool_call.call_id
+                ):
+                    original_chat.buffer.remove(item)
+                    logger.debug(
+                        'Removed re-injected function_call for call_id=%s',
+                        tool_call.call_id,
+                    )
+                    break
+
+            logger.info(
+                "Voice tool executed server-side: %s -> %s",
+                tool_call.name, str(result)[:100],
+            )
+            executed = True
+
+        return executed
 
     def cleanup(self) -> None:
         pass
