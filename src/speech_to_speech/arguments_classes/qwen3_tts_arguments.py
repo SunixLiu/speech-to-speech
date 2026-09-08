@@ -29,7 +29,7 @@ class Qwen3TTSHandlerArguments:
         },
     )
     qwen3_tts_backend: Literal["ggml", "torch"] = field(
-        default="ggml",
+        default="torch",
         metadata={
             "help": "faster-qwen3-tts backend on non-macOS platforms. Options: 'ggml' or 'torch'. Default is 'ggml'. On Apple Silicon, mlx-audio is selected automatically and this option is ignored."
         },
