@@ -130,9 +130,7 @@ class Qwen3TTSHandlerArguments:
     )
     qwen3_tts_blocksize: int = field(
         default=512,
-        metadata={
-            "help": "Audio chunk size in samples for streaming output. Must match LocalAudioStreamer blocksize. Default is 512."
-        },
+        metadata={"help": "Audio chunk size in samples for streaming output. Default is 512."},
     )
     qwen3_tts_voice_registry_config: Optional[str] = field(
         default=None,
