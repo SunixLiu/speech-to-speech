@@ -1,0 +1,70 @@
+default_voice: trump-speech-2
+voices:
+- name: trump-speech-2
+  display_name: Trump-Speech-2
+  description: ''
+  tags: []
+  backend: torch
+  ref_text: as you've learned, when the United States goes up, you follow. It's really
+    become a staple in America. I've stopped the nationwrecking energy policies that
+    drive up prices while sending jobs and factories to the world's worst polluters.
+    They are indeed polluters under sleepy Joe Biden. New domestic oil and gas leases
+    fell by 95%. Think of that. And they wonder why was gasoline going up so fast.
+    The gasoline actually topped $5 a gallon and some places $7 a gallon and more
+    than 100 major power plants were violently shut down by incompetent people that
+    had no idea what the hell they were doing. Under my leadership, US natural gas
+    production is at an all-time high by far. US oil production is up by 730,000 barrels
+    a day. And last week, we picked up [snorts] 50 million barrels from Venezuela
+    alone. Venezuela has been an amazing place for so many years, but then they went
+    bad with their policies. 20 years ago, it was a great country, and now it's got
+    problems, but we're helping them. And those 50 million barrels, we're going to
+    be splitting up with them and they'll be making more money that they've made it
+    a long time. Venezuela is going to do fantastically well. We appreciate all of
+    the cooperation we've been giving. We've been given great cooperation. Once the
+    attack ended, the attack ended and they said, "Let's make a deal. More people
+    should do that." But Venezuela is going to make more money in the next 6 months
+    than they've made in the last 20 years. Every major oil company is coming in with
+    us. It's amazing. It's a beautiful thing to see. The leadership of the country
+    has been uh very good. They've been very very smart. The price of gasoline is
+    now below $2.50 50 cents a gallon in many states, $230 a gallon in most states,
+    and we'll soon be averaging less than $2 a gallon. [snorts] In many places, it's
+    already down even lower, $1.95 a gallon. Numerous states are at $1.99. Numbers
+    that nobody has heard for years. Actually, since my last administration, we got
+    it down to around those numbers. I've signed an order directing an approval of
+    many new nuclear reactors. We're going heavy into nuclear. I was not a big fan
+    because I didn't like the risk, the danger, but they have the what the progress
+    they've made with nuclear is unbelievable. And the safety progress they've made
+    is incredible. We're very much into the world of nuclear energy. And we can have
+    it now at good prices and very, very safe. And we're leading the world in AI by
+    a lot. We're leading China by a lot. I think President Xi respects what we've
+    done in part because I've allowed these big companies building these massive buildings
+    to build their own electric capacity. They're building their own power plants,
+    which when added up is more than any country anywhere in the world is doing. I
+    read recently an article in the Wall Street Journal that China's creating so much
+    energy, and they are. I got to hand it to them. But we're creating as much or
+    more and we're letting them do that. I'm very proud of it. It was my idea. I said,
+    "You can't create this much energy. We needed more than double the energy currently
+    in the country just to take care of the AI plants." And they said, "We can't do
+    that. We have an old grid system." And I came up with the idea, you know, you
+    people are brilliant. You have a lot of money. Let's see what you can do. you
+    can build your own electric generating plants. And they looked at me. They didn't
+    believe me. All of the names that are in the I think in the room right now if
+    you want to know the truth. They didn't believe it. And I said, "No, no, you can't."
+    They came back two weeks and they didn't have the plant. They said, "We thought
+    you were kidding." I said, "No, not only am I not kidding, you're going to have
+    your approvals within two weeks." I always say nuclear will nuclear will take
+    three weeks, but most aren't going that. They're going oil and gas. They're even
+    going coal in some cases. Because of my landslide election victory, the United
+    States avoided the catastrophic energy collapse which befell every European nation
+    that pursued the Green New Scam. Perhaps the greatest hoax in history. The Green
+    New Scam. Windmills all over the place.
+  npz_file: D:\01Projects\reachy\output-voices\trump-speech-2.npz
+- name: Indian-english
+  display_name: Indian-English
+  description: ''
+  tags: []
+  backend: torch
+  ref_text: So, always think about the opportunity you have rather than how bad it
+    is right now. There's always a flip side to it and it could always be worse than
+    this.
+  npz_file: D:\01Projects\reachy\output-voices\Indian-english.npz

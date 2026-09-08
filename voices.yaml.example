@@ -1,0 +1,45 @@
+# Voice Registry Configuration
+# Each voice entry defines a pre-extracted voice profile.
+#
+# Fields:
+#   name:         Unique identifier (used for switching)
+#   display_name: Human-readable name (shown to users/LLM)
+#   description:  Description for LLM to choose appropriate voice
+#   tags:         Keywords for search/filtering
+#   backend:      "ggml" (default) or "torch"
+#   spk_file:     Path to .spk file (GGML only)
+#   rvq_file:     Path to .rvq file (GGML only)
+#   npz_file:     Path to .npz file (Torch only)
+#   ref_text:     Reference text used during extraction (required for ICL mode)
+#
+# Relative paths are resolved against this config file's directory.
+
+default_voice: "default"
+
+voices:
+  - name: "default"
+    display_name: "默认女声"
+    description: "温柔自然的女声，适合日常对话和讲故事"
+    tags: ["female", "gentle", "daily", "storytelling"]
+    backend: "ggml"
+    spk_file: "voices/default/default.spk"
+    rvq_file: "voices/default/default.rvq"
+    ref_text: "你好，我是一个AI助手，很高兴为你服务。"
+
+  - name: "news_male"
+    display_name: "新闻男声"
+    description: "沉稳专业的男声，适合新闻播报和正式场合"
+    tags: ["male", "professional", "news", "formal"]
+    backend: "ggml"
+    spk_file: "voices/news_male/news_male.spk"
+    rvq_file: "voices/news_male/news_male.rvq"
+    ref_text: "欢迎收看今日新闻，以下是今天的要闻播报。"
+
+  - name: "warm_female"
+    display_name: "温暖女声"
+    description: "温暖亲切的女声，适合客服和情感陪伴"
+    tags: ["female", "warm", "customer_service", "empathy"]
+    backend: "ggml"
+    spk_file: "voices/warm_female/warm_female.spk"
+    rvq_file: "voices/warm_female/warm_female.rvq"
+    ref_text: "您好，请问有什么可以帮您的？"
