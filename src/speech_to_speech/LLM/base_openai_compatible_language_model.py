@@ -5,6 +5,7 @@ import io
 import ipaddress
 import logging
 import os
+import uuid
 import wave
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator, Iterator
@@ -912,7 +913,57 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if voice_tool_executed and not self._generation_is_stale(turn.gen) and self._turn_output_allowed(turn.turn_id, turn.turn_revision):
                 logger.info("Voice tool executed; triggering follow-up generation")
                 try:
-                    yield from self._generate(original_chat, original_chat, turn, optional_kwargs)
+                    # Build optional_kwargs without tools for follow-up generation to prevent
+                    # the LLM from calling voice tools again.
+                    follow_up_kwargs = {k: v for k, v in optional_kwargs.items() if k not in ("tools", "tool_choice")}
+
+                    # Build a clean active chat for the follow-up: keep only user messages
+                    # and function outputs, drop assistant text produced by the first
+                    # response. This prevents the LLM from seeing its own greeting and
+                    # repeating it, and the new response key keeps the follow-up as a
+                    # separate response so the output processor does not merge the two
+                    # EndOfResponse markers.  Only remove the assistant message(s) that
+                    # belong to the current turn's provisional generation so that
+                    # context from previous turns is preserved.
+                    follow_up_active = original_chat.copy()
+                    _current_item_ids = (
+                        original_chat._provisional_generations.get(turn.response_key, (set(),))[0]
+                    )
+                    follow_up_active.buffer = [
+                        item
+                        for item in follow_up_active.buffer
+                        if not (
+                            isinstance(item, RealtimeConversationItemAssistantMessage)
+                            and item.id in _current_item_ids
+                        )
+                    ]
+
+                    instructions = (
+                        turn.response.instructions
+                        if turn.response is not None and turn.response.instructions is not None
+                        else turn.runtime_config.session.instructions
+                    ) or ""
+                    wants_audio = response_wants_audio(turn.response)
+                    lang_name = language_name_for_prompt(
+                        turn.language_code, enable=self.enable_lang_prompt
+                    )
+                    self._apply_config(follow_up_active, instructions, wants_audio, language_name=lang_name)
+
+                    follow_up_turn = _Turn(
+                        language_code=turn.language_code,
+                        gen=turn.gen,
+                        runtime_config=turn.runtime_config,
+                        response=turn.response,
+                        turn_id=turn.turn_id,
+                        turn_revision=turn.turn_revision,
+                        speech_stopped_at_s=turn.speech_stopped_at_s,
+                        wants_audio=turn.wants_audio,
+                        response_key=uuid.uuid4().hex,
+                        prefetch_transaction=turn.prefetch_transaction,
+                        history_anchor_id=turn.history_anchor_id,
+                    )
+
+                    yield from self._generate(follow_up_active, original_chat, follow_up_turn, follow_up_kwargs)
                 except Exception as e:
                     logger.warning("Follow-up generation after voice tool failed: %s", e)
 
