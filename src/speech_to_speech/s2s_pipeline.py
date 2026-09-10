@@ -702,6 +702,46 @@ def build_local_pipeline(args: ParsedArguments, stop_event: Event) -> ThreadMana
     tool_response_create = True
     if local_audio.local_audio_tool_module:
         tools, tool_executor, tool_response_create = load_realtime_tool_module(local_audio.local_audio_tool_module)
+
+    # Add MCP tool support
+    if args.module_kwargs.mcp_config:
+        from speech_to_speech.mcp_manager import MCPManager
+
+        mcp_manager = MCPManager(args.module_kwargs.mcp_config)
+        mcp_manager.load_config()
+        # Initialize MCP manager in a new event loop
+        import asyncio
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(mcp_manager.initialize())
+        finally:
+            loop.close()
+
+        # Merge MCP tools with existing tools
+        mcp_tools = mcp_manager.get_tools()
+        tools = tools + mcp_tools
+
+        # Create combined tool executor
+        existing_executor = tool_executor
+
+        async def combined_executor(name: str, arguments: dict[str, Any]) -> Any:
+            if name in mcp_manager.tool_to_server:
+                return await mcp_manager.execute_tool(name, arguments)
+            if existing_executor:
+                return await existing_executor(name, arguments)
+            raise ValueError(f"Unknown tool: {name}")
+
+        # Wrap async executor for sync use
+        def sync_combined_executor(name: str, arguments: dict[str, Any]) -> Any:
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(combined_executor(name, arguments))
+            finally:
+                loop.close()
+
+        tool_executor = sync_combined_executor
+
     server_manager = build_pipeline(args, stop_event, host="127.0.0.1")
     client = RealtimeAudioClient(
         stop_event,

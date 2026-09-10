@@ -1,0 +1,30 @@
+{
+  "servers": [
+    {
+      "name": "weather",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["@modelcontextprotocol/server-weather"],
+      "enabled": true
+    },
+    {
+      "name": "github",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_TOKEN": "ghp_xxx"
+      },
+      "enabled": true
+    },
+    {
+      "name": "remote-tools",
+      "transport": "http",
+      "url": "http://localhost:8080/mcp",
+      "headers": {
+        "Authorization": "Bearer token123"
+      },
+      "enabled": false
+    }
+  ]
+}

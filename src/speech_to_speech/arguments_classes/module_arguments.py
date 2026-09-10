@@ -102,3 +102,10 @@ class ModuleArguments:
             "num_pipelines; further connections are rejected. Default is 1."
         },
     )
+    mcp_config: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to MCP server configuration JSON file. Enables integration with external "
+            "tools and services through the Model Context Protocol."
+        },
+    )

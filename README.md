@@ -252,6 +252,62 @@ or another compatible server, see
 For native incremental audio and partial transcripts, see
 [stateful streaming STT](./docs/openai-compatible-stt.md#stateful-streaming-stt).
 
+## MCP Support
+
+The pipeline supports the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) for integrating external tools and services. Configure MCP servers in a JSON file and pass it to the pipeline with `--mcp-config`.
+
+### Configuration
+
+Create an MCP server configuration file:
+
+```json
+{
+  "servers": [
+    {
+      "name": "weather",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["@modelcontextprotocol/server-weather"],
+      "enabled": true
+    },
+    {
+      "name": "github",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_TOKEN": "ghp_xxx"
+      },
+      "enabled": true
+    }
+  ]
+}
+```
+
+Supported transports:
+- `stdio`: Run a local MCP server process (default)
+- `http`: Connect to a remote MCP server via HTTP/SSE
+- `websocket`: Connect to a remote MCP server via WebSocket
+
+### Usage
+
+```bash
+speech-to-speech local \
+    --stt parakeet-tdt \
+    --llm_backend responses-api \
+    --tts qwen3 \
+    --mcp-config ./examples/mcp_servers.json
+```
+
+MCP tools are automatically discovered and made available to the LLM. Tool names are prefixed with the server name to avoid conflicts (e.g., `weather_get_weather`, `github_list_issues`).
+
+### Example MCP Servers
+
+- [Weather](https://github.com/modelcontextprotocol/servers/tree/main/src/weather)
+- [GitHub](https://github.com/modelcontextprotocol/servers/tree/main/src/github)
+- [Filesystem](https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem)
+- [PostgreSQL](https://github.com/modelcontextprotocol/servers/tree/main/src/postgres)
+
 ## Commands
 
 | Command | Behavior | Use it when |
@@ -672,6 +728,7 @@ See [ModuleArguments](./src/speech_to_speech/arguments_classes/module_arguments.
 - logging level
 - transcript logging (`--log_transcripts`)
 - realtime pipeline pool size (`--num_pipelines`)
+- MCP server configuration (`--mcp-config`)
 
 Logs are content-free by default: transcript-bearing records report a character count rather
 than the text, because logs are commonly retained by service managers, containers and hosted
