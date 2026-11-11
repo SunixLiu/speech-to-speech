@@ -233,3 +233,4 @@ uv.lock
 
 # JavaScript dependencies
 node_modules/
+DEVELOPMENT_LOG.md
