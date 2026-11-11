@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator, Sized
 from queue import Empty
 from threading import Lock, Thread
+from time import perf_counter
 from typing import Any, Literal, Optional, Protocol, runtime_checkable
 
 import torch
@@ -39,11 +40,16 @@ from speech_to_speech.LLM.chat import (
     ChatItemError,
     build_active_chat,
     make_assistant_message,
-    make_system_message,
 )
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn, build_compactor
 from speech_to_speech.LLM.text_prompt import build_text_system_prompt
-from speech_to_speech.LLM.tool_call.function_call import extract_function_calls_from_text
+from speech_to_speech.LLM.tool_call.function_call import (
+    JSON_TOOL_CALL_END,
+    JSON_TOOL_CALL_ENTER,
+    extract_function_calls_from_text,
+    find_json_tool_call_end,
+    parse_json_tool_call_block,
+)
 from speech_to_speech.LLM.tool_call.function_tool import FunctionTool
 from speech_to_speech.LLM.tool_call.tool_prompt import END_CODE, ENTER_CODE, build_block_regex, build_tool_system_prompt
 from speech_to_speech.LLM.utils import (
@@ -58,6 +64,7 @@ from speech_to_speech.LLM.voice_prompt import build_voice_system_prompt
 from speech_to_speech.TTS.voice_tools import SWITCH_VOICE_TOOL, LIST_VOICES_TOOL
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import LLMIn, LLMOut
+from speech_to_speech.pipeline.history import ResponseHistory
 from speech_to_speech.pipeline.messages import (
     AssistantOutputPart,
     AssistantTextPart,
@@ -70,7 +77,8 @@ from speech_to_speech.pipeline.messages import (
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_log
-from speech_to_speech.utils.utils import is_out_of_band, response_wants_audio
+from speech_to_speech.pipeline.turn_latency import active_turn_latency_tracker, bind_active_turn_latency_tracker
+from speech_to_speech.utils.utils import TORCH_DEVICES, is_out_of_band, resolve_device, response_wants_audio
 
 try:
     import mlx.core as mx
@@ -134,9 +142,11 @@ class StreamContext(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    stream_exhausted: bool = False
     cancelled: bool = False
     stopped: bool = False
     raw_generated_text: str = ""
+    llm_start_s: float | None = None
     generated_text: str = ""
     printable_text: str = ""
     tools: list[ResponseFunctionToolCall] = Field(default_factory=list)
@@ -151,9 +161,6 @@ class StreamContext(BaseModel):
     speech_stopped_at_s: float | None = None
     cancel_generation: int | None = None
     output_parts: list[AssistantOutputPart] = Field(default_factory=list)
-    history_parts_committed: int = 0
-    recorded_item_ids: set[str] = Field(default_factory=set)
-    recorded_call_ids: set[str] = Field(default_factory=set)
     prefetch_transaction: ResponsePrefetchTransaction | None = None
 
     @property
@@ -176,8 +183,8 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
     def setup(
         self,
-        model_name: str = "Qwen/Qwen3-4B-Instruct-2507",
-        device: str = "cuda",
+        model_name: str = "Qwen/Qwen3.5-4B",
+        device: str = "auto",
         torch_dtype: str = "float16",
         gen_kwargs: dict[str, Any] = {},
         user_role: str = "user",
@@ -190,6 +197,8 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         compact_history: bool = False,
         **_kwargs: Any,
     ) -> None:
+        if backend == "transformers":
+            device = resolve_device(device, TORCH_DEVICES, "Transformers LLM")
         self.backend = backend
         self.cancel_scope = cancel_scope
         self.speculative_turns = speculative_turns
@@ -214,7 +223,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
     def _turn_output_allowed(self, turn_id: str | None, turn_revision: int | None) -> bool:
         if self.speculative_turns is None:
             return True
-        return self.speculative_turns.is_latest_after_reopen_grace(turn_id, turn_revision)
+        return self.speculative_turns.wait_for_gate(turn_id, turn_revision)
 
     @abstractmethod
     def _load_model(
@@ -256,14 +265,17 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         """Close the MLX generator to release resources immediately."""
         token_iter.close()
 
-    def _finish_transformers_generation(self, thread: Thread) -> None:
-        """Signal the stopping criteria, drain the streamer, and join the thread."""
+    def _finish_transformers_generation(self, thread: Thread, ctx: StreamContext) -> None:
+        """Stop generation, drain unfinished output, and join the thread."""
         self._cancel_criteria.cancel()
-        try:
-            for _ in self.streamer:
+        # TextIteratorStreamer consumes its end marker once; reading again waits
+        # for its queue timeout even though generation has already finished.
+        if not ctx.stream_exhausted:
+            try:
+                for _ in self.streamer:
+                    pass
+            except Empty:
                 pass
-        except Empty:
-            pass
         thread.join(timeout=5.0)
 
     # ------------------------------------------------------------------
@@ -281,12 +293,11 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         *,
         language_name: str | None = None,
     ) -> None:
-        if not instructions and not language_name:
-            return
-
         raw_tools = raw_tools or []
 
         function_tools = [FunctionTool(**t.model_dump()) for t in raw_tools if t.type == "function"]
+        if not instructions and not language_name and not function_tools:
+            return
 
         build_system_prompt = build_voice_system_prompt if wants_audio else build_text_system_prompt
 
@@ -300,13 +311,23 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             block_regex = build_block_regex()
             enter_code = ENTER_CODE
             end_code = END_CODE
+        elif function_tools:
+            # tool_choice="none": tools exist but this response must not call them.
+            # Models that saw earlier tool calls may still emit one; keep detecting
+            # tool blocks so they are stripped from speech, but expose no tools so
+            # nothing gets executed.
+            full_instructions = build_system_prompt(instructions or "", language_name=language_name)
+            block_regex = build_block_regex()
+            enter_code = ENTER_CODE
+            end_code = END_CODE
+            function_tools = []
         else:
             full_instructions = build_system_prompt(instructions or "", language_name=language_name)
             block_regex = None
             enter_code = None
             end_code = None
 
-        chat.add_item(make_system_message(full_instructions))
+        chat.prepend_instructions(full_instructions)
 
         if ctx is not None:
             ctx.function_tools = function_tools
@@ -347,26 +368,44 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 cancel_generation=ctx.cancel_generation,
             )
 
-        while ctx.enter_code and ctx.enter_code in printable_text:
-            idx = printable_text.index(ctx.enter_code)
+        # Tool-call blocks we recognise: the prompted ``<code>name(...)</code>``
+        # form, plus the ``<tool_call>{json}</tool_call>`` form many models fall
+        # back to. Only active when tools are in play.
+        markers: list[tuple[str, str, str]] = []
+        if ctx.enter_code and ctx.end_code:
+            markers = [(ctx.enter_code, ctx.end_code, "code"), (JSON_TOOL_CALL_ENTER, JSON_TOOL_CALL_END, "json")]
+
+        while True:
+            found = [(printable_text.index(m[0]), m) for m in markers if m[0] in printable_text]
+            if not found:
+                break
+            idx, (enter, end, kind) = min(found, key=lambda f: f[0])
             before = printable_text[:idx]
             code_and_after = printable_text[idx:]
             if text_only and before:
                 chunks.append(text_chunk(before))
             elif before.strip():
+                before = remove_unspeechable(before)
                 for s in sent_tokenize_preserving_markdown_code(before, sent_tokenize):
                     ctx.sentence_batch.append(remove_markdown(s))
             if ctx.sentence_batch:
                 chunks.append(text_chunk(" ".join(ctx.sentence_batch)))
                 ctx.sentence_batch = []
-            if not ctx.block_regex or not ctx.end_code or ctx.end_code not in code_and_after:
+            if kind == "json":
+                block_end = find_json_tool_call_end(code_and_after)
+            else:
+                block_end = code_and_after.index(end) + len(end) if ctx.block_regex and end in code_and_after else None
+            if block_end is None:
                 # Preserve the incomplete block until more streamed text arrives.
                 return chunks, tools, code_and_after
 
-            block_end = code_and_after.index(ctx.end_code) + len(ctx.end_code)
             complete_block = code_and_after[:block_end]
             printable_text = code_and_after[block_end:]
-            _, func_calls = extract_function_calls_from_text(complete_block, ctx.block_regex)
+            if kind == "code":
+                assert ctx.block_regex is not None
+                _, func_calls = extract_function_calls_from_text(complete_block, ctx.block_regex)
+            else:
+                func_calls = parse_json_tool_call_block(complete_block)
             parsed_tools: list[ResponseFunctionToolCall] = []
             for fc in func_calls:
                 try:
@@ -395,18 +434,20 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # the longest suffix that could become ``<code>`` in the next token.
             # This keeps text-only output verbatim without exposing tool syntax.
             pending_marker = ""
-            if ctx.enter_code:
-                max_prefix_length = min(len(ctx.enter_code) - 1, len(printable_text))
-                for prefix_length in range(max_prefix_length, 0, -1):
-                    if printable_text.endswith(ctx.enter_code[:prefix_length]):
+            for enter, _end, _kind in markers:
+                max_prefix_length = min(len(enter) - 1, len(printable_text))
+                for prefix_length in range(max_prefix_length, len(pending_marker), -1):
+                    if printable_text.endswith(enter[:prefix_length]):
                         pending_marker = printable_text[-prefix_length:]
-                        printable_text = printable_text[:-prefix_length]
                         break
+            if pending_marker:
+                printable_text = printable_text[: -len(pending_marker)]
             if printable_text:
                 chunks.append(text_chunk(printable_text))
             return chunks, tools, pending_marker
 
         if printable_text:
+            printable_text = remove_unspeechable(printable_text)
             trailing_whitespace = printable_text[len(printable_text.rstrip()) :]
             sentences = sent_tokenize_preserving_markdown_code(printable_text, sent_tokenize)
             if len(sentences) > 1:
@@ -420,17 +461,10 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         return chunks, tools, printable_text
 
     @staticmethod
-    def _commit_ordered_output(
-        chat: Chat,
-        parts: list[AssistantOutputPart],
-        *,
-        wants_audio: bool,
-        response_key: str | None = None,
-        recorded_item_ids: set[str] | None = None,
-        recorded_call_ids: set[str] | None = None,
-        after_item_id: str | None = None,
-    ) -> bool:
-        """Persist exactly the ordered text/tool stream emitted to the client."""
+    def _ordered_output_items(
+        parts: list[AssistantOutputPart], *, wants_audio: bool
+    ) -> list[RealtimeConversationItemAssistantMessage | RealtimeConversationItemFunctionCall]:
+        """Build the history proposal in the same order as emitted model parts."""
         text_parts: list[str] = []
         items: list[RealtimeConversationItemAssistantMessage | RealtimeConversationItemFunctionCall] = []
 
@@ -447,6 +481,8 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if isinstance(part, AssistantTextPart):
                 text_parts.append(part.text)
                 continue
+            if not isinstance(part, AssistantToolCallPart):
+                continue
             flush_text()
             tool = part.tool
             items.append(
@@ -461,27 +497,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             )
         flush_text()
 
-        if response_key is not None:
-            recorded_items = chat.add_provisional_generation_items(response_key, items, after_item_id=after_item_id)
-            if recorded_items is None:
-                return False
-        else:
-            recorded_items = []
-            for item in items:
-                if isinstance(item, RealtimeConversationItemFunctionCall):
-                    recorded_items.append(chat.add_ordered_function_call(item, after_item_id=after_item_id))
-                else:
-                    recorded_items.append(chat.add_item(item, after_item_id=after_item_id))
-        for recorded in recorded_items:
-            if recorded_item_ids is not None and recorded.id is not None:
-                recorded_item_ids.add(recorded.id)
-            if (
-                recorded_call_ids is not None
-                and isinstance(recorded, RealtimeConversationItemFunctionCall)
-                and recorded.call_id is not None
-            ):
-                recorded_call_ids.add(recorded.call_id)
-        return True
+        return items
 
     def _check_stop(self, gen: int | None, ctx: StreamContext) -> bool:
         """Check whether generation should be aborted and mark the reason on *ctx*."""
@@ -513,13 +529,14 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         response: RealtimeResponseCreateParams | None = None,
     ) -> Iterator[LLMResponseChunk]:
         """Consume *token_iter*, accumulate text in *ctx*, yield sentence chunks."""
-        # Text-only output keeps every character; only audio strips TTS-unfriendly
-        # symbols via remove_unspeechable.
+        # Keep the parsing buffer raw: speech filtering can invalidate JSON or
+        # change tool arguments. _process_printable_text filters audio prose only.
         wants_audio = response_wants_audio(response)
         while True:
             try:
                 token = next(token_iter)
             except StopIteration:
+                ctx.stream_exhausted = True
                 break
             except Empty:
                 if self._check_stop(gen, ctx):
@@ -530,10 +547,14 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 break
 
             raw_text: str = token.text if hasattr(token, "text") else token
+            if raw_text.strip() and ctx.llm_start_s is not None:
+                tracker = active_turn_latency_tracker()
+                if tracker is not None and tracker.llm_ttft_s is None:
+                    tracker.record_llm_ttft(perf_counter() - ctx.llm_start_s)
             ctx.raw_generated_text += raw_text
             clean = raw_text if not wants_audio else remove_unspeechable(raw_text)
             ctx.generated_text += clean
-            ctx.printable_text += clean
+            ctx.printable_text += raw_text
             chunks, ctx.tools, ctx.printable_text = self._process_printable_text(
                 ctx.printable_text,
                 language_code,
@@ -547,6 +568,18 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 logger.info("LLM generation cancelled (stale speculative turn)")
                 break
             yield from chunks
+
+        if ctx.enter_code and ctx.end_code and not ctx.interrupted:
+            # Pending tool syntax must not reach either the sentence-batch flush
+            # below or process()'s final text chunk when generation ends early.
+            for marker in (ctx.enter_code, JSON_TOOL_CALL_ENTER):
+                if ctx.printable_text.startswith(marker):
+                    ctx.printable_text = ""
+                    break
+                for length in range(min(len(marker) - 1, len(ctx.printable_text)), 0, -1):
+                    if ctx.printable_text.endswith(marker[:length]):
+                        ctx.printable_text = ctx.printable_text[:-length]
+                        break
 
         if ctx.sentence_batch and not ctx.interrupted:
             if ctx.printable_text.strip():
@@ -602,8 +635,9 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         # Snapshot the end of the conversation before generating so this turn's
         # output is written back at its own position even when non-interrupting
         # speech appends a newer user message while the model is still running.
-        history_anchor_id = original_chat.history_anchor_id()
-        if not out_of_band and original_chat.has_pending_tool_calls():
+        active_chat = original_chat.copy(deep=True)
+        history_anchor_id = active_chat.history_anchor_id()
+        if not out_of_band and active_chat.has_pending_tool_calls():
             yield EndOfResponse(
                 turn_id=ctx.turn_id,
                 turn_revision=ctx.turn_revision,
@@ -614,7 +648,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return
         if out_of_band:
             try:
-                active_chat = build_active_chat(original_chat, response)
+                active_chat = build_active_chat(active_chat, response)
             except ChatItemError as exc:
                 log_exception(logger, "Out-of-band response rejected", exc, level=logging.INFO)
                 yield EndOfResponse(
@@ -625,8 +659,6 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     error=str(exc),
                 )
                 return
-        else:
-            active_chat = original_chat.copy()
         language_code = request.language_code
         language_code, _ = resolve_auto_language(language_code)
         lang_name = language_name_for_prompt(language_code, enable=self.enable_lang_prompt)
@@ -651,44 +683,38 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         # so an image a fast client injects mid-generation for the next turn
         # survives (it is not in this serialized snapshot).
         consumed_image_ids = active_chat.image_message_ids()
-        history_committed = False
-        history_rolled_back = False
-
-        def rollback_history() -> None:
-            nonlocal history_rolled_back
-            if out_of_band or history_committed or history_rolled_back:
-                return
-            if not (ctx.recorded_item_ids or ctx.recorded_call_ids):
-                return
-            original_chat.rollback_generation(
-                None,
-                item_ids=ctx.recorded_item_ids,
-                call_ids=ctx.recorded_call_ids,
-                response_key=request.response_key,
-            )
-            history_rolled_back = True
+        generation_completed = False
+        history = None if out_of_band else ResponseHistory.capture(original_chat, [], after_item_id=history_anchor_id)
 
         try:
-            for chunk in self._generate(active_chat, language_code, gen, ctx, runtime_config, response):
-                chunk.response_key = request.response_key
-                chunk.prefetch_transaction = request.prefetch_transaction
-                new_parts = [part.model_copy(deep=True) for part in chunk.parts]
-                ctx.output_parts.extend(new_parts)
-                if not out_of_band and any(isinstance(part, AssistantToolCallPart) for part in new_parts):
-                    recorded = self._commit_ordered_output(
-                        original_chat,
-                        ctx.output_parts[ctx.history_parts_committed :],
-                        wants_audio=response_wants_audio(response),
-                        response_key=request.response_key,
-                        recorded_item_ids=ctx.recorded_item_ids,
-                        recorded_call_ids=ctx.recorded_call_ids,
-                        after_item_id=history_anchor_id,
-                    )
-                    if not recorded:
-                        ctx.cancelled = True
-                        break
-                    ctx.history_parts_committed = len(ctx.output_parts)
-                yield chunk
+            store = getattr(self, "turn_latency_store", None)
+            tracker = store.get_response(request.response_key) if store else None
+            llm_start_s = perf_counter()
+            ctx.llm_start_s = llm_start_s
+            if tracker is not None:
+                tracker.record_llm_start(llm_start_s)
+            try:
+                with bind_active_turn_latency_tracker(tracker):
+                    for chunk in self._generate(active_chat, language_code, gen, ctx, runtime_config, response):
+                        chunk.selected_language = request.selected_language
+                        chunk.response_key = request.response_key
+                        chunk.prefetch_transaction = request.prefetch_transaction
+                        new_parts = [part.model_copy(deep=True) for part in chunk.parts]
+                        ctx.output_parts.extend(new_parts)
+                        if not out_of_band and any(isinstance(part, AssistantToolCallPart) for part in new_parts):
+                            chunk.history = ResponseHistory.capture(
+                                original_chat,
+                                self._ordered_output_items(
+                                    ctx.output_parts, wants_audio=response_wants_audio(response)
+                                ),
+                                after_item_id=history_anchor_id,
+                            )
+                        yield chunk
+            finally:
+                # Publish the elapsed work before the failure handler yields a
+                # terminal that can finish the response on another thread.
+                if tracker is not None:
+                    tracker.record_llm(perf_counter() - llm_start_s)
 
             if ctx.stopped:
                 return
@@ -711,37 +737,19 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     cancel_generation=ctx.cancel_generation,
                     response_key=request.response_key,
                     prefetch_transaction=request.prefetch_transaction,
+                    selected_language=request.selected_language,
                 )
                 ctx.output_parts.extend(part.model_copy(deep=True) for part in trailing_chunk.parts)
             if commit_allowed:
-                commit_allowed = self._commit_ordered_output(
+                history = ResponseHistory.capture(
                     original_chat,
-                    ctx.output_parts[ctx.history_parts_committed :],
-                    wants_audio=response_wants_audio(response),
-                    response_key=request.response_key,
-                    recorded_item_ids=ctx.recorded_item_ids,
-                    recorded_call_ids=ctx.recorded_call_ids,
+                    self._ordered_output_items(ctx.output_parts, wants_audio=response_wants_audio(response)),
                     after_item_id=history_anchor_id,
+                    complete=True,
+                    consumed_image_ids=consumed_image_ids,
+                    compactor=self.compactor,
                 )
-                if commit_allowed:
-                    ctx.history_parts_committed = len(ctx.output_parts)
-
-                    def cleanup_history() -> None:
-                        snapshot = original_chat.snapshot_history_cleanup()
-                        try:
-                            original_chat.strip_images(consumed_image_ids)
-                            original_chat.trim_if_needed(self.compactor)
-                        except Exception:
-                            original_chat.restore_history_cleanup(snapshot)
-                            raise
-
-                    if request.prefetch_transaction is not None:
-                        request.prefetch_transaction.complete(cleanup_history)
-                    else:
-                        cleanup_history()
-                    history_committed = True
-                else:
-                    trailing_chunk = None
+            generation_completed = turn_output_allowed
             logger.debug("Clean text: %s", transcript_for_log(ctx.generated_text))
             logger.info("Tools: %s", transcript_for_log(ctx.tools))
 
@@ -810,12 +818,12 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # the exception would escape process() and no EndOfResponse would be
             # emitted, leaving st.in_response stuck and locking every later response.
             log_exception(logger, "LLM generation failed; ending the current response", exc)
-            rollback_history()
             if request.prefetch_transaction is not None:
                 # The terminal is queued before this generator resumes into its
                 # finally block, so publish failure before yielding it.
                 request.prefetch_transaction.discard()
             yield EndOfResponse(
+                history=history,
                 turn_id=ctx.turn_id,
                 turn_revision=ctx.turn_revision,
                 cancel_generation=ctx.cancel_generation,
@@ -824,16 +832,17 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             )
             return
         finally:
-            rollback_history()
-            if request.prefetch_transaction is not None and not history_committed:
+            if request.prefetch_transaction is not None and not generation_completed:
                 # Make failed hidden work unclaimable before its asynchronous
                 # logical-done notification reaches the realtime service.
                 request.prefetch_transaction.discard()
         yield EndOfResponse(
+            history=history,
             turn_id=ctx.turn_id,
             turn_revision=ctx.turn_revision,
             cancel_generation=ctx.cancel_generation,
             response_key=request.response_key,
+            input_tool_call_ids=active_chat.tool_output_call_ids() if commit_allowed else [],
         )
 
     def on_session_end(self) -> None:
@@ -912,6 +921,9 @@ class LanguageModelHandler(BaseLanguageModelHandler):
 
         if self.backend == "mlx":
             with MLXLockContext(handler_name="MLX-LLM", timeout=10.0):
+                tracker = active_turn_latency_tracker()
+                if tracker is not None:
+                    tracker.start_llm()
                 token_iter = mlx_stream_generate(
                     self.model,  # type: ignore[arg-type]
                     self.tokenizer,  # type: ignore[arg-type]
@@ -942,15 +954,18 @@ class LanguageModelHandler(BaseLanguageModelHandler):
             if ctx.prefetch_transaction is not None:
                 ctx.prefetch_transaction.register_abort(self._cancel_criteria.cancel)
             lock = self._transformers_lock
+            tracker = active_turn_latency_tracker()
 
             def _locked_pipe() -> None:
                 with lock:
+                    if tracker is not None:
+                        tracker.start_llm()
                     self.pipe(chat_prompt, **self.gen_kwargs)
 
             thread = Thread(target=_locked_pipe)
             thread.start()
             yield from self._stream_tokens(self.streamer, gen, language_code, ctx, runtime_config, response)
-            self._finish_transformers_generation(thread)
+            self._finish_transformers_generation(thread, ctx)
             if self.device == "mps":
                 torch.mps.empty_cache()
 
@@ -1098,6 +1113,9 @@ class VisionLanguageModelHandler(BaseLanguageModelHandler):
             logger.debug("MLX VLM prompt token count: %d", ctx.input_tokens)
 
             with MLXLockContext(handler_name="MLX-VLM", timeout=10.0):
+                tracker = active_turn_latency_tracker()
+                if tracker is not None:
+                    tracker.start_llm()
                 token_iter = mlx_vlm_stream_generate(  # type: ignore[arg-type]
                     self.model,
                     self.processor,
@@ -1137,15 +1155,18 @@ class VisionLanguageModelHandler(BaseLanguageModelHandler):
                 "stopping_criteria": StoppingCriteriaList([self._cancel_criteria]),
             }
             lock = self._transformers_lock
+            tracker = active_turn_latency_tracker()
 
             def _locked_generate() -> None:
                 with lock:
+                    if tracker is not None:
+                        tracker.start_llm()
                     self.model.generate(**generate_kwargs)  # type: ignore[union-attr,operator]
 
             thread = Thread(target=_locked_generate)
             thread.start()
             yield from self._stream_tokens(self.streamer, gen, language_code, ctx, runtime_config, response)
-            self._finish_transformers_generation(thread)
+            self._finish_transformers_generation(thread, ctx)
             if self.device == "mps":
                 torch.mps.empty_cache()
 

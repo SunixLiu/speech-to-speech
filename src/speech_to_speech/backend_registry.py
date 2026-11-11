@@ -13,29 +13,44 @@ from speech_to_speech.arguments_classes.chat_completions_language_model_argument
     ChatCompletionsLanguageModelHandlerArguments,
 )
 from speech_to_speech.arguments_classes.chat_tts_arguments import ChatTTSHandlerArguments
+from speech_to_speech.arguments_classes.drama3_tts_arguments import Drama3TTSHandlerArguments
 from speech_to_speech.arguments_classes.facebookmms_tts_arguments import FacebookMMSTTSHandlerArguments
 from speech_to_speech.arguments_classes.faster_whisper_stt_arguments import (
     FasterWhisperSTTHandlerArguments,
 )
+from speech_to_speech.arguments_classes.kitten_tts_arguments import KittenTTSHandlerArguments
 from speech_to_speech.arguments_classes.kokoro_tts_arguments import KokoroTTSHandlerArguments
-from speech_to_speech.arguments_classes.language_model_arguments import LanguageModelHandlerArguments
+from speech_to_speech.arguments_classes.language_model_arguments import (
+    LanguageModelHandlerArguments,
+    MLXLanguageModelHandlerArguments,
+)
+from speech_to_speech.arguments_classes.minimax_tts_arguments import MiniMaxTTSHandlerArguments
 from speech_to_speech.arguments_classes.mlx_audio_whisper_arguments import (
     MLXAudioWhisperSTTHandlerArguments,
+)
+from speech_to_speech.arguments_classes.nemotron_streaming_stt_arguments import (
+    NemotronStreamingSTTHandlerArguments,
 )
 from speech_to_speech.arguments_classes.omnivoice_tts_arguments import OmniVoiceTTSHandlerArguments
 from speech_to_speech.arguments_classes.openai_realtime_stt_arguments import OpenAIRealtimeSTTHandlerArguments
 from speech_to_speech.arguments_classes.openai_stt_arguments import OpenAICompatibleSTTHandlerArguments
 from speech_to_speech.arguments_classes.openai_tts_arguments import OpenAICompatibleTTSHandlerArguments
+from speech_to_speech.arguments_classes.orukeet_stt_arguments import OrukeetSTTHandlerArguments
 from speech_to_speech.arguments_classes.paraformer_stt_arguments import ParaformerSTTHandlerArguments
 from speech_to_speech.arguments_classes.parakeet_tdt_arguments import (
     ParakeetTDTSTTHandlerArguments,
 )
+from speech_to_speech.arguments_classes.parakeet_unified_stt_arguments import (
+    ParakeetUnifiedSTTHandlerArguments,
+)
+from speech_to_speech.arguments_classes.phonon_tts_arguments import PhononTTSHandlerArguments
 from speech_to_speech.arguments_classes.pocket_tts_arguments import PocketTTSHandlerArguments
 from speech_to_speech.arguments_classes.qwen3_asr_stt_arguments import Qwen3ASRSTTHandlerArguments
 from speech_to_speech.arguments_classes.qwen3_tts_arguments import Qwen3TTSHandlerArguments
 from speech_to_speech.arguments_classes.responses_api_language_model_arguments import (
     ResponsesApiLanguageModelHandlerArguments,
 )
+from speech_to_speech.arguments_classes.sense_voice_stt_arguments import SenseVoiceSTTHandlerArguments
 from speech_to_speech.arguments_classes.supertonic_tts_arguments import SupertonicTTSHandlerArguments
 from speech_to_speech.arguments_classes.vllm_realtime_stt_arguments import VLLMRealtimeSTTHandlerArguments
 from speech_to_speech.arguments_classes.whisper_stt_arguments import WhisperSTTHandlerArguments
@@ -78,6 +93,7 @@ class HandlerContext:
     sample_rate: int
     enable_live_transcription: bool
     live_transcription_update_interval: float
+    detect_llm_output_language: bool = False
 
 
 HandlerFactory = Callable[[HandlerContext, Mapping[str, Any]], Any]
@@ -167,15 +183,6 @@ def build_backend_registry(kind: BackendKind, specs: Iterable[BackendSpec]) -> d
     return registry
 
 
-def select_backend(registry: Mapping[str, BackendSpec], name: str, config: Any) -> BackendSelection:
-    try:
-        spec = registry[name]
-    except KeyError as exc:
-        choices = ", ".join(registry)
-        raise ValueError(f"Unsupported backend {name!r}; choose one of: {choices}.") from exc
-    return BackendSelection(spec, spec.normalize(config))
-
-
 def _optional_dependency_error(selection: BackendSelection, exc: BaseException) -> ImportError | None:
     extra = selection.spec.required_extra
     if extra is None:
@@ -216,6 +223,7 @@ def _simple_handler_factory(
     setup_should_listen: bool = False,
     attach_speculative_turns: bool = False,
     context_kwargs: bool = False,
+    pass_assistant_language_flag: bool = False,
 ) -> HandlerFactory:
     def create(context: HandlerContext, config: Mapping[str, Any]) -> Any:
         handler_class = _load_handler(module_name, class_name)
@@ -225,6 +233,8 @@ def _simple_handler_factory(
                 cancel_scope=context.cancel_scope,
                 speculative_turns=context.speculative_turns,
             )
+        if pass_assistant_language_flag:
+            setup_kwargs["detect_llm_output_language"] = context.detect_llm_output_language
         handler = handler_class(
             context.stop_event,
             queue_in=context.queue_in,
@@ -270,6 +280,14 @@ def _create_parakeet(context: HandlerContext, config: Mapping[str, Any]) -> Any:
     return handler
 
 
+def _create_orukeet(context: HandlerContext, config: Mapping[str, Any]) -> Any:
+    return _simple_handler_factory(
+        "speech_to_speech.STT.nemo_asr_handler",
+        "NemoASRSTTHandler",
+        attach_speculative_turns=True,
+    )(context, {**config, "detect_language_from_text": True})
+
+
 def _create_openai_tts(context: HandlerContext, config: Mapping[str, Any]) -> Any:
     handler_class = _load_handler(
         "speech_to_speech.TTS.openai_compatible_handler",
@@ -284,6 +302,7 @@ def _create_openai_tts(context: HandlerContext, config: Mapping[str, Any]) -> An
             **config,
             "cancel_scope": context.cancel_scope,
             "speculative_turns": context.speculative_turns,
+            "detect_llm_output_language": context.detect_llm_output_language,
         },
     )
 
@@ -393,6 +412,38 @@ STT_BACKENDS = build_backend_registry(
             config_prefix="parakeet_tdt",
         ),
         BackendSpec(
+            "parakeet-unified",
+            "stt",
+            ParakeetUnifiedSTTHandlerArguments,
+            _simple_handler_factory(
+                "speech_to_speech.STT.nemo_asr_handler",
+                "NemoASRSTTHandler",
+                attach_speculative_turns=True,
+            ),
+            config_prefix="parakeet_unified",
+            required_extra="nemo",
+        ),
+        BackendSpec(
+            "nemotron-streaming",
+            "stt",
+            NemotronStreamingSTTHandlerArguments,
+            _simple_handler_factory(
+                "speech_to_speech.STT.nemo_asr_handler",
+                "NemoASRSTTHandler",
+                attach_speculative_turns=True,
+            ),
+            config_prefix="nemotron_streaming",
+            required_extra="nemo",
+        ),
+        BackendSpec(
+            "orukeet",
+            "stt",
+            OrukeetSTTHandlerArguments,
+            _create_orukeet,
+            config_prefix="orukeet",
+            required_extra="nemo",
+        ),
+        BackendSpec(
             "paraformer",
             "stt",
             ParaformerSTTHandlerArguments,
@@ -403,6 +454,18 @@ STT_BACKENDS = build_backend_registry(
             ),
             config_prefix="paraformer_stt",
             required_extra="paraformer",
+        ),
+        BackendSpec(
+            "sense-voice",
+            "stt",
+            SenseVoiceSTTHandlerArguments,
+            _simple_handler_factory(
+                "speech_to_speech.STT.sense_voice_handler",
+                "SenseVoiceSTTHandler",
+                attach_speculative_turns=True,
+            ),
+            config_prefix="sense_voice_stt",
+            required_extra="sensevoice",
         ),
         BackendSpec(
             "qwen3-asr",
@@ -458,7 +521,7 @@ LLM_BACKENDS = build_backend_registry(
         BackendSpec(
             "mlx-lm",
             "llm",
-            LanguageModelHandlerArguments,
+            MLXLanguageModelHandlerArguments,
             _create_local_llm("mlx-lm"),
             config_prefix="llm",
             required_extra="mlx-lm",
@@ -545,6 +608,19 @@ TTS_BACKENDS = build_backend_registry(
             required_extra="pocket",
         ),
         BackendSpec(
+            "phonon",
+            "tts",
+            PhononTTSHandlerArguments,
+            _simple_handler_factory(
+                "speech_to_speech.TTS.phonon_tts_handler",
+                "PhononTTSHandler",
+                setup_should_listen=True,
+                context_kwargs=True,
+            ),
+            config_prefix="phonon_tts",
+            required_extra="phonon",
+        ),
+        BackendSpec(
             "kokoro",
             "tts",
             KokoroTTSHandlerArguments,
@@ -558,6 +634,19 @@ TTS_BACKENDS = build_backend_registry(
             required_extra="kokoro",
         ),
         BackendSpec(
+            "kitten",
+            "tts",
+            KittenTTSHandlerArguments,
+            _simple_handler_factory(
+                "speech_to_speech.TTS.kitten_tts_handler",
+                "KittenTTSHandler",
+                setup_should_listen=True,
+                context_kwargs=True,
+            ),
+            config_prefix="kitten",
+            required_extra="kitten",
+        ),
+        BackendSpec(
             "qwen3",
             "tts",
             Qwen3TTSHandlerArguments,
@@ -566,6 +655,7 @@ TTS_BACKENDS = build_backend_registry(
                 "Qwen3TTSHandler",
                 setup_should_listen=True,
                 context_kwargs=True,
+                pass_assistant_language_flag=True,
             ),
             config_prefix="qwen3_tts",
         ),
@@ -575,6 +665,30 @@ TTS_BACKENDS = build_backend_registry(
             OpenAICompatibleTTSHandlerArguments,
             _create_openai_tts,
             config_prefix="openai_tts",
+        ),
+        BackendSpec(
+            "drama3",
+            "tts",
+            Drama3TTSHandlerArguments,
+            _simple_handler_factory(
+                "speech_to_speech.TTS.drama3_handler",
+                "Drama3TTSHandler",
+                setup_should_listen=True,
+                context_kwargs=True,
+            ),
+            config_prefix="drama3",
+        ),
+        BackendSpec(
+            "minimax",
+            "tts",
+            MiniMaxTTSHandlerArguments,
+            _simple_handler_factory(
+                "speech_to_speech.TTS.minimax_tts_handler",
+                "MiniMaxTTSHandler",
+                setup_should_listen=True,
+                context_kwargs=True,
+            ),
+            config_prefix="minimax_tts",
         ),
         BackendSpec(
             "supertonic",

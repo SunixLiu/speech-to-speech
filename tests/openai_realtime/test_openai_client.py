@@ -37,12 +37,9 @@ from speech_to_speech.api.openai_realtime.audio_client import (
     ToolResult,
     listen_and_play_realtime,
 )
-from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit
-from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.api.openai_realtime.websocket_router import create_app
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.LLM.lm_output_processor import LMOutputProcessor
-from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.events import (
     AssistantOutputEvent,
     AssistantToolCallReadyEvent,
@@ -63,6 +60,7 @@ from speech_to_speech.pipeline.messages import (
     TTSInput,
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
+from tests.openai_realtime.conftest import make_pipeline_unit
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -83,31 +81,16 @@ class _ServerEnv:
     """Wraps a running uvicorn server + all pipeline queues."""
 
     def __init__(self):
-        self.text_prompt_queue: Queue = Queue()
-        self.should_listen = ThreadingEvent()
-        self.should_listen.set()
-        self.service = RealtimeService(
-            text_prompt_queue=self.text_prompt_queue,
-            should_listen=self.should_listen,
-        )
-        self.input_queue: Queue = Queue()
-        self.output_queue: Queue = Queue()
-        self.text_output_queue: Queue = Queue()
+        self.unit = make_pipeline_unit()
+        self.service = self.unit.service
+        self.text_prompt_queue = self.unit.text_prompt_queue
+        self.should_listen = self.unit.should_listen
+        self.input_queue = self.unit.input_queue
+        self.output_queue = self.unit.output_queue
+        self.text_output_queue = self.unit.text_output_queue
+        self.response_playing = self.unit.response_playing
+        self.cancel_scope = self.unit.cancel_scope
         self.stop_event = ThreadingEvent()
-        self.response_playing = ThreadingEvent()
-        self.cancel_scope = CancelScope()
-        self.unit = PipelineUnit(
-            index=0,
-            service=self.service,
-            cancel_scope=self.cancel_scope,
-            should_listen=self.should_listen,
-            response_playing=self.response_playing,
-            input_queue=self.input_queue,
-            output_queue=self.output_queue,
-            text_output_queue=self.text_output_queue,
-            text_prompt_queue=self.text_prompt_queue,
-            handlers=[],
-        )
         self.app = create_app(pool=[self.unit], stop_event=self.stop_event)
         self.port = _free_port()
         self._server_thread: threading.Thread | None = None
@@ -237,7 +220,7 @@ class TestSDKSessionUpdate:
             )
             await asyncio.sleep(0.2)
 
-            cid = server_env.service.connection_ids[0]
+            cid = list(server_env.service._conns)[0]
             s = server_env.service._state(cid).runtime_config.session
             assert s.audio.output.voice == "alloy"
             assert s.instructions == "You are a helpful robot"
@@ -282,6 +265,14 @@ class TestSDKVoiceTurn:
             assert event.type == SPEECH_STOPPED
             assert event.audio_end_ms == 0
             assert event.item_id == item_id
+            committed = await _recv(conn)
+            created = await _recv(conn)
+            assert committed.type == "input_audio_buffer.committed"
+            assert created.type == "conversation.item.created"
+            assert committed.item_id == created.item.id == item_id
+            assert committed.previous_item_id is None
+            assert created.previous_item_id is None
+            assert created.item.content[0].type == "input_audio"
 
             server_env.text_output_queue.put(TranscriptionCompletedEvent(transcript="hello"))
             event = await _recv(conn)
@@ -416,7 +407,7 @@ class TestPackagedAudioClient:
             assert len(first_chunk) == 1024
             first_generation = server_env.cancel_scope.generation
 
-            tracker.observe("turn_1", 0)
+            tracker.start_turn()
             tracker.start_reopen_grace("turn_1", 0, 5.0)
             server_env.text_output_queue.put(SpeechStartedEvent(turn_id="turn_1", turn_revision=0))
             server_env.text_output_queue.put(
@@ -629,13 +620,11 @@ class TestPackagedAudioClient:
         try:
             await wait_until(
                 lambda: (
-                    bool(server_env.service.connection_ids)
-                    and bool(
-                        server_env.service._state(server_env.service.connection_ids[0]).runtime_config.session.tools
-                    )
+                    bool(list(server_env.service._conns))
+                    and bool(server_env.service._state(list(server_env.service._conns)[0]).runtime_config.session.tools)
                 )
             )
-            conn_id = server_env.service.connection_ids[0]
+            conn_id = list(server_env.service._conns)[0]
             chat = server_env.service._state(conn_id).runtime_config.chat
             chat.add_item(
                 RealtimeConversationItemFunctionCall(
@@ -844,6 +833,8 @@ class TestSDKPhantomSpeech:
             server_env.text_output_queue.put(SpeechStoppedEvent())
             event = await _recv(conn)
             assert event.type == SPEECH_STOPPED
+            assert (await _recv(conn)).type == "input_audio_buffer.committed"
+            assert (await _recv(conn)).type == "conversation.item.created"
 
             server_env.text_output_queue.put(SpeechStartedEvent())
             event = await _recv(conn)
@@ -852,6 +843,8 @@ class TestSDKPhantomSpeech:
             server_env.text_output_queue.put(SpeechStoppedEvent(duration_s=2.0))
             event = await _recv(conn)
             assert event.type == SPEECH_STOPPED
+            assert (await _recv(conn)).type == "input_audio_buffer.committed"
+            assert (await _recv(conn)).type == "conversation.item.created"
 
             server_env.output_queue.put(_pcm_bytes(256))
             event = await _recv(conn)
@@ -1170,7 +1163,9 @@ class TestSDKMultiTurn:
             await _recv(conn)
 
             server_env.text_output_queue.put(SpeechStoppedEvent())
-            await _recv(conn)
+            assert (await _recv(conn)).type == SPEECH_STOPPED
+            assert (await _recv(conn)).type == "input_audio_buffer.committed"
+            assert (await _recv(conn)).type == "conversation.item.created"
 
             server_env.text_output_queue.put(TranscriptionCompletedEvent(transcript="hi"))
             await _recv(conn)
@@ -1196,7 +1191,9 @@ class TestSDKMultiTurn:
 
             # Turn 2
             server_env.text_output_queue.put(SpeechStoppedEvent())
-            await _recv(conn)
+            assert (await _recv(conn)).type == SPEECH_STOPPED
+            assert (await _recv(conn)).type == "input_audio_buffer.committed"
+            assert (await _recv(conn)).type == "conversation.item.created"
 
             server_env.text_output_queue.put(TranscriptionCompletedEvent(transcript="bye"))
             await _recv(conn)

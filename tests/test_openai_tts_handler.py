@@ -10,11 +10,15 @@ from time import perf_counter
 
 import numpy as np
 import pytest
-from openai.types.realtime import RealtimeSessionCreateRequest
+from openai.types.realtime import RealtimeSessionCreateRequest, ResponseCreateEvent, SessionUpdateEvent
 from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
 from scipy.io import wavfile
+from scipy.signal import resample_poly
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
+from speech_to_speech.api.openai_realtime.service import RealtimeService
+from speech_to_speech.LLM.lm_output_processor import LMOutputProcessor
+from speech_to_speech.pipeline import language_detection
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.control import SESSION_END
 from speech_to_speech.pipeline.events import ResponseFailedEvent
@@ -23,15 +27,19 @@ from speech_to_speech.pipeline.messages import (
     PIPELINE_END,
     AudioOutput,
     EndOfResponse,
+    GenerateResponseRequest,
+    LLMResponseChunk,
     TTSInput,
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.TTS import openai_compatible_handler as tts_module
+from speech_to_speech.TTS.drama3_handler import Drama3TTSHandler
 from speech_to_speech.TTS.openai_compatible_handler import (
     HttpSpeechOperation,
     OpenAICompatibleTTSHandler,
     SpeechRequestCancelled,
 )
+from tests.turns import reopen
 
 
 class _FakeSpeechOperation:
@@ -74,9 +82,9 @@ class _CountingSpeculativeTurnTracker(SpeculativeTurnTracker):
         super().__init__()
         self.commit_calls = 0
 
-    def commit_if_latest_after_reopen_grace(self, turn_id: str | None, revision: int | None) -> bool:
-        self.commit_calls += 1
-        return super().commit_if_latest_after_reopen_grace(turn_id, revision)
+    def wait_for_gate(self, turn_id: str | None, revision: int | None, **kwargs) -> bool:
+        self.commit_calls += kwargs.get("commit", False)
+        return super().wait_for_gate(turn_id, revision, **kwargs)
 
 
 def _reset_fake_speech_operation() -> None:
@@ -90,18 +98,19 @@ def _reset_fake_speech_operation() -> None:
 def _openai_tts_handler(
     monkeypatch,
     *,
+    backend: str = "openai",
     cancel_scope: CancelScope | None = None,
     speculative_turns: SpeculativeTurnTracker | None = None,
 ) -> OpenAICompatibleTTSHandler:
     _reset_fake_speech_operation()
     monkeypatch.setattr(tts_module, "HttpSpeechOperation", _FakeSpeechOperation)
-    handler = OpenAICompatibleTTSHandler(
+    handler_class = Drama3TTSHandler if backend == "drama3" else OpenAICompatibleTTSHandler
+    handler = handler_class(
         Event(),
         queue_in=Queue(),
         queue_out=Queue(),
         setup_args=(Event(),),
         setup_kwargs={
-            "sample_rate": 24000,
             "blocksize": 512,
             "cancel_scope": cancel_scope,
             "speculative_turns": speculative_turns,
@@ -191,23 +200,335 @@ def test_openai_tts_does_not_infer_language_from_pipeline(monkeypatch):
     assert "language" not in payload
 
 
-def test_openai_tts_streaming_resampler_is_chunk_invariant_and_anti_aliased():
-    sample_rate = 24000
+def test_openai_tts_auto_setup_stays_auto_without_assistant_detection(monkeypatch):
+    handler = _openai_tts_handler(monkeypatch)
+    handler.language = "Auto"
+
+    assert list(handler.process(TTSInput(text="Hello", language_code="en")))
+
+    assert _FakeSpeechOperation.instances[0].payload["language"] == "Auto"
+
+
+@pytest.mark.parametrize(
+    ("session_language", "setup_language", "detected_language", "expected_language"),
+    [
+        (None, "Auto", "en", "English"),
+        ("auto", "Auto", "en", "English"),
+        ("auto", "Auto", "es", "Spanish"),
+        ("auto", "Auto", "hi", "Auto"),  # Unsupported by Qwen3-TTS; keep explicit auto.
+        ("auto", "Auto", "ca", "Auto"),
+        ("es", "Auto", "en", "English"),
+        ("en", "Auto", "es", "Spanish"),
+        ("en", "Auto", "nl", "English"),  # Qwen3-TTS cannot speak Dutch; keep the session language.
+        (None, "French", "en", "French"),
+    ],
+)
+def test_detected_assistant_language_reaches_openai_tts_payload(
+    monkeypatch, session_language, setup_language, detected_language, expected_language
+):
+    monkeypatch.setattr(language_detection, "warm_language_detector", lambda: object())
+    monkeypatch.setattr(language_detection, "detect_language_from_text", lambda *args, **kwargs: detected_language)
+    handler = _openai_tts_handler(monkeypatch)
+    handler.language = setup_language
+    handler.detect_llm_output_language = True
+    processor = LMOutputProcessor.__new__(LMOutputProcessor)
+    processor.setup(detect_llm_output_language=True)
+    session = RealtimeSessionCreateRequest(type="realtime")
+    if session_language is not None:
+        session = RealtimeSessionCreateRequest(
+            type="realtime", audio={"input": {"transcription": {"language": session_language}}}
+        )
+    config = RuntimeConfig(session=session)
+
+    outputs = list(
+        processor.process(
+            LLMResponseChunk(
+                text="I can help you find the nearest train station.",
+                language_code="fr",  # STT language must not override the assistant's language.
+                runtime_config=config,
+            )
+        )
+    )
+    list(handler.process(next(item for item in outputs if isinstance(item, TTSInput))))
+
+    assert _FakeSpeechOperation.instances[0].payload["language"] == expected_language
+    assert config.selected_language == session_language  # STT keeps the session selection.
+
+
+def test_omitted_language_keeps_auto_for_short_first_batch_and_prior_assistant_fallback(monkeypatch):
+    monkeypatch.setattr(language_detection, "warm_language_detector", lambda: object())
+    monkeypatch.setattr(
+        language_detection,
+        "detect_language_from_text",
+        lambda text, *args, **kwargs: "en" if "nearest train station" in text else None,
+    )
+    handler = _openai_tts_handler(monkeypatch)
+    handler.language = "Auto"
+    handler.detect_llm_output_language = True
+    processor = LMOutputProcessor.__new__(LMOutputProcessor)
+    processor.setup(detect_llm_output_language=True)
+    config = RuntimeConfig()
+
+    def speak(text):
+        outputs = list(processor.process(LLMResponseChunk(text=text, language_code="es", runtime_config=config)))
+        tts_input = next(item for item in outputs if isinstance(item, TTSInput))
+        list(handler.process(tts_input))
+        return tts_input
+
+    first = speak("Sure.")
+    later = speak("I can help you find the nearest train station.")
+    list(processor.process(EndOfResponse()))
+    speak("Sí.")
+
+    assert first.tts_language_code is None
+    assert later.tts_language_code == "en"  # Local TTS still receives later detection.
+    assert [operation.payload["language"] for operation in _FakeSpeechOperation.instances] == [
+        "Auto",
+        "Auto",
+        "English",
+    ]
+
+
+def test_omitted_language_keeps_qwen_auto_for_unsupported_detected_language(monkeypatch):
+    monkeypatch.setattr(language_detection, "warm_language_detector", lambda: object())
+    monkeypatch.setattr(language_detection, "detect_language_from_text", lambda *args, **kwargs: "ca")
+    handler = _openai_tts_handler(monkeypatch)
+    handler.language = "Auto"
+    handler.detect_llm_output_language = True
+    processor = LMOutputProcessor.__new__(LMOutputProcessor)
+    processor.setup(detect_llm_output_language=True)
+    config = RuntimeConfig()
+
+    outputs = list(
+        processor.process(
+            LLMResponseChunk(
+                text="Puc ajudar-te a trobar l'estació de tren més propera.",
+                language_code="es",
+                runtime_config=config,
+            )
+        )
+    )
+    list(handler.process(next(item for item in outputs if isinstance(item, TTSInput))))
+
+    assert _FakeSpeechOperation.instances[0].payload["language"] == "Auto"
+
+
+def test_explicit_auto_keeps_qwen_auto_for_unsupported_prior_assistant_language(monkeypatch):
+    monkeypatch.setattr(language_detection, "warm_language_detector", lambda: object())
+    monkeypatch.setattr(
+        language_detection,
+        "detect_language_from_text",
+        lambda text, *args, **kwargs: "hi" if "railway station" in text else None,
+    )
+    handler = _openai_tts_handler(monkeypatch)
+    handler.language = "Auto"
+    handler.detect_llm_output_language = True
+    processor = LMOutputProcessor.__new__(LMOutputProcessor)
+    processor.setup(detect_llm_output_language=True)
+    config = RuntimeConfig(
+        session=RealtimeSessionCreateRequest(type="realtime", audio={"input": {"transcription": {"language": "auto"}}})
+    )
+
+    def speak(text):
+        outputs = list(processor.process(LLMResponseChunk(text=text, runtime_config=config)))
+        tts_input = next(item for item in outputs if isinstance(item, TTSInput))
+        list(handler.process(tts_input))
+        return tts_input
+
+    speak("Main aapko nearest railway station dhoondhne mein madad kar sakta hoon.")
+    list(processor.process(EndOfResponse()))
+    fallback = speak("Sure.")
+
+    assert fallback.tts_language_code == "hi"  # Inconclusive first batch reuses the prior assistant language.
+    assert [operation.payload["language"] for operation in _FakeSpeechOperation.instances] == ["Auto", "Auto"]
+
+
+def test_first_response_uses_session_selected_language(monkeypatch):
+    handler = _openai_tts_handler(monkeypatch)
+    handler.language = "English"
+    runtime_config = RuntimeConfig(
+        session=RealtimeSessionCreateRequest(
+            type="realtime",
+            audio={"input": {"transcription": {"language": "es"}}},
+        )
+    )
+
+    assert list(handler.process(TTSInput(text="Hola", runtime_config=runtime_config)))
+
+    assert _FakeSpeechOperation.instances[0].payload["language"] == "Spanish"
+
+
+def test_explicit_auto_replaces_setup_language_for_short_first_reply(monkeypatch):
+    handler = _openai_tts_handler(monkeypatch)
+    handler.language = "English"
+    runtime_config = RuntimeConfig(
+        session=RealtimeSessionCreateRequest(
+            type="realtime",
+            audio={"input": {"transcription": {"language": "auto"}}},
+        )
+    )
+
+    assert list(handler.process(TTSInput(text="Sure.", language_code=None, runtime_config=runtime_config)))
+
+    assert _FakeSpeechOperation.instances[0].payload["language"] == "Auto"
+    assert handler.language == "English"
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected_language"),
+    [
+        ("我可以帮助您找到最近的火车站，并说明如何购买前往市中心的车票。", "Chinese"),
+        ("私は最寄りの駅を探して、市内への切符を購入する方法を説明することができます。", "Japanese"),
+        ("가장 가까운 기차역을 찾고 시내로 가는 표를 구매하는 방법을 안내해 드릴 수 있습니다.", "Korean"),
+    ],
+)
+def test_auto_tts_detects_asian_language_after_english_at_request_boundary(monkeypatch, answer, expected_language):
+    handler = _openai_tts_handler(monkeypatch)
+    handler.model = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    processor = LMOutputProcessor.__new__(LMOutputProcessor)
+    processor.setup()
+    config = RuntimeConfig(
+        session=RealtimeSessionCreateRequest(type="realtime", audio={"input": {"transcription": {"language": "auto"}}})
+    )
+
+    for text in ("I can help you find the nearest train station in the city.", answer):
+        outputs = list(processor.process(LLMResponseChunk(text=text, language_code="en", runtime_config=config)))
+        tts_input = next(item for item in outputs if isinstance(item, TTSInput))
+        list(handler.process(tts_input))
+        list(processor.process(EndOfResponse()))
+
+    assert [operation.payload["language"] for operation in _FakeSpeechOperation.instances] == [
+        "English",
+        expected_language,
+    ]
+
+
+def test_mid_response_update_applies_to_next_response(monkeypatch):
+    handler = _openai_tts_handler(monkeypatch)
+    handler.model = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    processor = LMOutputProcessor.__new__(LMOutputProcessor)
+    processor.setup()
+    config = RuntimeConfig(
+        session=RealtimeSessionCreateRequest(type="realtime", audio={"input": {"transcription": {"language": "es"}}})
+    )
+
+    def speak(text: str, turn_id: str) -> None:
+        outputs = list(processor.process(LLMResponseChunk(text=text, runtime_config=config, turn_id=turn_id)))
+        list(handler.process(next(item for item in outputs if isinstance(item, TTSInput))))
+
+    speak("Hola.", "turn-1")
+    config.session.audio.input.transcription.language = "de"
+    speak("¿Cómo estás?", "turn-1")
+    list(processor.process(EndOfResponse(turn_id="turn-1")))
+    speak("Guten Tag.", "turn-2")
+
+    assert [operation.payload["language"] for operation in _FakeSpeechOperation.instances] == [
+        "Spanish",
+        "Spanish",
+        "German",
+    ]
+
+
+def test_queued_tts_input_keeps_response_selection(monkeypatch):
+    handler = _openai_tts_handler(monkeypatch)
+    handler.model = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    processor = LMOutputProcessor.__new__(LMOutputProcessor)
+    processor.setup()
+    config = RuntimeConfig(
+        session=RealtimeSessionCreateRequest(type="realtime", audio={"input": {"transcription": {"language": "es"}}})
+    )
+
+    def pending_input(text: str) -> TTSInput:
+        outputs = list(processor.process(LLMResponseChunk(text=text, language_code="es", runtime_config=config)))
+        return next(item for item in outputs if isinstance(item, TTSInput))
+
+    first = pending_input("I can help you find the train station in London.")
+    config.session.audio.input.transcription.language = "auto"
+    list(handler.process(first))
+
+    second = pending_input("The station is on the next street.")
+    config.session.audio.input.transcription.language = "de"
+    list(handler.process(second))
+
+    assert [operation.payload["language"] for operation in _FakeSpeechOperation.instances] == ["Spanish", "Spanish"]
+
+
+def test_pending_response_uses_selection_at_response_create(monkeypatch):
+    handler = _openai_tts_handler(monkeypatch)
+    handler.model = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    processor = LMOutputProcessor.__new__(LMOutputProcessor)
+    processor.setup()
+    queue = Queue()
+    service = RealtimeService(text_prompt_queue=queue)
+    conn_id = service.register()
+    config = service._state(conn_id).runtime_config
+
+    def select(language: str) -> None:
+        update = SessionUpdateEvent.model_validate(
+            {
+                "type": "session.update",
+                "session": {"type": "realtime", "audio": {"input": {"transcription": {"language": language}}}},
+            }
+        )
+        assert service.handle_session_update(conn_id, update) is None
+
+    def create_response() -> GenerateResponseRequest:
+        service.handle_response_create(
+            conn_id, ResponseCreateEvent(type="response.create", response={"conversation": "none"})
+        )
+        return queue.get_nowait()
+
+    def speak(text: str, request: GenerateResponseRequest) -> None:
+        items = list(
+            processor.process(
+                LLMResponseChunk(
+                    text=text,
+                    response_key=request.response_key,
+                    runtime_config=config,
+                    selected_language=request.selected_language,
+                )
+            )
+        )
+        tts_input = next(item for item in items if isinstance(item, TTSInput))
+        list(handler.process(tts_input))
+
+    select("es")
+    first_request = create_response()
+    assert first_request.selected_language == "es"
+    select("de")
+    assert first_request.selected_language == "es"
+    speak("Hola.", first_request)
+    select("fr")
+    speak("¿Cómo estás?", first_request)
+    list(processor.process(EndOfResponse(response_key=first_request.response_key)))
+    service.response._end_response(conn_id)
+    next_request = create_response()
+    assert next_request.selected_language == "fr"
+    speak("Bonjour.", next_request)
+
+    assert [operation.payload["language"] for operation in _FakeSpeechOperation.instances] == [
+        "Spanish",
+        "Spanish",
+        "French",
+    ]
+
+
+@pytest.mark.parametrize(("backend", "sample_rate"), [("openai", 24000), ("openai", 44100), ("drama3", 44100)])
+def test_openai_tts_streaming_resampler_is_chunk_invariant_and_anti_aliased(monkeypatch, backend, sample_rate):
+    handler = _openai_tts_handler(monkeypatch, backend=backend)
     duration_s = 0.2
     timeline = np.arange(int(sample_rate * duration_s)) / sample_rate
     passband = np.round(16000 * np.sin(2 * np.pi * 1000 * timeline)).astype(np.int16)
     stopband = np.round(16000 * np.sin(2 * np.pi * 10000 * timeline)).astype(np.int16)
 
     def resample(samples, chunk_sizes):
-        resampler = tts_module._StreamingFIRResampler(sample_rate, 16000)
-        output = []
+        chunks = []
         offset = 0
         for chunk_size in chunk_sizes:
-            output.append(resampler.push(samples[offset : offset + chunk_size]))
+            chunks.append(samples[offset : offset + chunk_size])
             offset += chunk_size
-        output.append(resampler.push(samples[offset:]))
-        output.append(resampler.push(np.empty(0, dtype=np.int16), final=True))
-        return np.concatenate(output)
+        chunks.append(samples[offset:])
+        return np.concatenate(list(handler._resample_to_blocks(iter(chunks), sample_rate)))
 
     passband_streamed = resample(passband, [1, 301, 17, 1024, 3])
     passband_single = resample(passband, [])
@@ -216,6 +537,29 @@ def test_openai_tts_streaming_resampler_is_chunk_invariant_and_anti_aliased():
     np.testing.assert_array_equal(passband_streamed, passband_single)
     assert np.sqrt(np.mean(passband_streamed.astype(np.float64) ** 2)) > 10000
     assert np.sqrt(np.mean(stopband_streamed.astype(np.float64) ** 2)) < 500
+
+
+@pytest.mark.parametrize("final_with_input", [False, True])
+def test_openai_tts_44100_resampler_matches_whole_signal(final_with_input):
+    samples = np.random.default_rng(44100).integers(-32768, 32768, size=4411).astype(np.float64)
+    # Full-scale plateaus also exercise saturation after filtering.
+    samples[1500:1700] = 32767
+    samples[1700:1900] = -32768
+    resampler = tts_module._StreamingFIRResampler(44100, 16000)
+    chunks = np.array_split(samples, [1, 1477, 2953])
+    parts = [resampler.push(chunk) for chunk in chunks[:-1]]
+    parts.append(resampler.push(chunks[-1], final=final_with_input))
+    # Pin per-push availability as well as the complete signal's numerical result.
+    assert [part.size for part in parts] == [0, 526, 536, 539 if final_with_input else 529]
+    if not final_with_input:
+        assert resampler.push(np.empty(0)).size == 0
+        tail = resampler.push(np.empty(0), final=True)
+        assert tail.size == 10
+        parts.append(tail)
+    output = np.concatenate(parts)
+    reference = np.clip(np.round(resample_poly(samples, 16000, 44100)), -32768, 32767).astype(np.int16)
+    assert output.dtype == np.int16
+    np.testing.assert_allclose(output.astype(np.int32), reference.astype(np.int32), rtol=0, atol=1)
 
 
 def test_openai_tts_vllm_stream_extension_is_opt_in(monkeypatch):
@@ -328,7 +672,7 @@ def test_openai_tts_standard_request_yields_audio_before_response_eof(monkeypatc
 
 def test_openai_tts_http_failure_before_audio_does_not_commit(monkeypatch):
     tracker = _CountingSpeculativeTurnTracker()
-    tracker.observe("turn-1", 0)
+    tracker.start_turn()
     handler = _openai_tts_handler(monkeypatch, speculative_turns=tracker)
     _FakeSpeechOperation.startup_error = tts_module.SpeechRequestError("speech server returned HTTP 500")
 
@@ -336,7 +680,7 @@ def test_openai_tts_http_failure_before_audio_does_not_commit(monkeypatch):
         handler.process(
             TTSInput(
                 text="Hello",
-                turn_id="turn-1",
+                turn_id="turn_1",
                 turn_revision=0,
                 response_key="response-1",
             )
@@ -345,26 +689,26 @@ def test_openai_tts_http_failure_before_audio_does_not_commit(monkeypatch):
 
     assert chunks == []
     assert tracker.commit_calls == 0
-    assert not tracker.is_committed("turn-1", 0)
+    assert not tracker.is_committed("turn_1", 0)
     failure = handler.queue_out.get_nowait()
     assert isinstance(failure, ResponseFailedEvent)
     assert failure.message == "speech server returned HTTP 500"
-    assert failure.turn_id == "turn-1"
+    assert failure.turn_id == "turn_1"
     assert failure.turn_revision == 0
     assert failure.response_key == "response-1"
 
 
 def test_openai_tts_stale_keyed_terminal_becomes_cleanup(monkeypatch):
     tracker = SpeculativeTurnTracker()
-    tracker.observe("turn-1", 0)
+    tracker.start_turn()
     handler = _openai_tts_handler(monkeypatch, speculative_turns=tracker)
     terminal = EndOfResponse(
         response_key="response-1",
-        turn_id="turn-1",
+        turn_id="turn_1",
         turn_revision=0,
         cancel_generation=7,
     )
-    tracker.observe("turn-1", 1)
+    reopen(tracker)
 
     outputs = list(handler.process(terminal))
     queued = handler.output_for_queue(outputs[0], terminal)
@@ -637,7 +981,7 @@ def test_openai_tts_decodes_streaming_wav_with_unknown_data_length(monkeypatch):
 
 def test_openai_tts_cancellation_before_audio_does_not_commit(monkeypatch):
     tracker = _CountingSpeculativeTurnTracker()
-    tracker.observe("turn-1", 0)
+    tracker.start_turn()
     cancel_scope = CancelScope()
     handler = _openai_tts_handler(
         monkeypatch,
@@ -650,7 +994,7 @@ def test_openai_tts_cancellation_before_audio_does_not_commit(monkeypatch):
         handler.process(
             TTSInput(
                 text="Hello",
-                turn_id="turn-1",
+                turn_id="turn_1",
                 turn_revision=0,
                 cancel_generation=cancel_scope.generation,
             )
@@ -659,20 +1003,20 @@ def test_openai_tts_cancellation_before_audio_does_not_commit(monkeypatch):
 
     assert chunks == []
     assert tracker.commit_calls == 0
-    assert not tracker.is_committed("turn-1", 0)
+    assert not tracker.is_committed("turn_1", 0)
     assert _FakeSpeechOperation.instances[0].cancelled is True
 
 
 def test_openai_tts_first_emitted_audio_commits_exactly_once(monkeypatch):
     tracker = _CountingSpeculativeTurnTracker()
-    tracker.observe("turn-1", 0)
+    tracker.start_turn()
     handler = _openai_tts_handler(monkeypatch, speculative_turns=tracker)
 
     chunks = list(
         handler.process(
             TTSInput(
                 text="Hello",
-                turn_id="turn-1",
+                turn_id="turn_1",
                 turn_revision=0,
             )
         )
@@ -680,20 +1024,21 @@ def test_openai_tts_first_emitted_audio_commits_exactly_once(monkeypatch):
 
     assert chunks
     assert tracker.commit_calls == 1
-    assert tracker.is_committed("turn-1", 0)
+    assert tracker.is_committed("turn_1", 0)
 
 
 def test_openai_tts_reopened_during_startup_suppresses_old_revision(monkeypatch):
     tracker = _CountingSpeculativeTurnTracker()
-    tracker.observe("turn-1", 0)
+    tracker.start_turn()
     handler = _openai_tts_handler(monkeypatch, speculative_turns=tracker)
-    _FakeSpeechOperation.startup_action = lambda: tracker.observe("turn-1", 1)
+
+    _FakeSpeechOperation.startup_action = lambda: reopen(tracker)
 
     chunks = list(
         handler.process(
             TTSInput(
                 text="Hello",
-                turn_id="turn-1",
+                turn_id="turn_1",
                 turn_revision=0,
             )
         )
@@ -701,14 +1046,16 @@ def test_openai_tts_reopened_during_startup_suppresses_old_revision(monkeypatch)
 
     assert chunks == []
     assert tracker.commit_calls == 0
-    assert not tracker.is_committed("turn-1", 0)
+    assert not tracker.is_committed("turn_1", 0)
     assert _FakeSpeechOperation.instances[0].cancelled is True
 
 
-def test_openai_tts_cancellation_stops_publication_and_closes_operation(monkeypatch):
+@pytest.mark.parametrize(("backend", "sample_rate"), [("openai", 24000), ("openai", 44100), ("drama3", 44100)])
+def test_openai_tts_cancellation_stops_publication_and_closes_operation(monkeypatch, backend, sample_rate):
     cancel_scope = CancelScope()
-    handler = _openai_tts_handler(monkeypatch, cancel_scope=cancel_scope)
+    handler = _openai_tts_handler(monkeypatch, backend=backend, cancel_scope=cancel_scope)
 
+    handler.sample_rate = sample_rate
     generation = handler.process(TTSInput(text="Hello", cancel_generation=cancel_scope.generation))
     first = next(generation)
     cancel_scope.cancel()
@@ -718,8 +1065,10 @@ def test_openai_tts_cancellation_stops_publication_and_closes_operation(monkeypa
     assert _FakeSpeechOperation.instances[0].cancelled is True
 
 
-def test_openai_tts_session_teardown_stops_publication_and_closes_operation(monkeypatch):
-    handler = _openai_tts_handler(monkeypatch)
+@pytest.mark.parametrize(("backend", "sample_rate"), [("openai", 24000), ("openai", 44100), ("drama3", 44100)])
+def test_openai_tts_session_teardown_stops_publication_and_closes_operation(monkeypatch, backend, sample_rate):
+    handler = _openai_tts_handler(monkeypatch, backend=backend)
+    handler.sample_rate = sample_rate
     generation = handler.process(TTSInput(text="Hello"))
     first = next(generation)
     operation = _FakeSpeechOperation.instances[0]
