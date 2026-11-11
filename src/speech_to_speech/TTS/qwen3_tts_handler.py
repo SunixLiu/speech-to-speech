@@ -472,8 +472,15 @@ class Qwen3TTSHandler(BaseTTSHandler):
         return None
 
     def _has_voice_clone_reference(self) -> bool:
-        has_cached_voice = self._cached_ref_spk is not None or self._cached_ref_spk_emb is not None
-        return bool(self.ref_audio or getattr(self, "ref_spk", None) or has_cached_voice)
+        has_cached_voice = (
+            getattr(self, "_cached_ref_spk", None) is not None
+            or getattr(self, "_cached_ref_spk_emb", None) is not None
+        )
+        return bool(
+            getattr(self, "ref_audio", None)
+            or getattr(self, "ref_spk", None)
+            or has_cached_voice
+        )
 
     def _clear_cached_voice_reference(self) -> None:
         self.ref_spk = None
@@ -578,8 +585,9 @@ class Qwen3TTSHandler(BaseTTSHandler):
 
         # Check voice registry for named voice match (exact, then case-insensitive
         # name or display name)
-        if self.voice_registry is not None:
-            profile = self.voice_registry.resolve(session_voice)
+        voice_registry = getattr(self, "voice_registry", None)
+        if voice_registry is not None:
+            profile = voice_registry.resolve(session_voice)
             if profile is not None:
                 self._apply_voice_profile(profile)
                 return
@@ -590,8 +598,8 @@ class Qwen3TTSHandler(BaseTTSHandler):
             return
 
         # Fallback to default voice from registry if available
-        if self.voice_registry is not None:
-            default = self.voice_registry.get_default()
+        if voice_registry is not None:
+            default = voice_registry.get_default()
             if default:
                 logger.info("Falling back to default voice: %s (%s)", default.display_name, default.name)
                 self._apply_voice_profile(default)
@@ -1090,23 +1098,31 @@ class Qwen3TTSHandler(BaseTTSHandler):
             "non_streaming_mode": self.non_streaming_mode,
         }
 
-        # Use cached voice reference if available (dynamic voice switching)
-        if self._cached_ref_spk is not None:
+        # Use cached voice reference if available (dynamic voice switching).
+        # getattr keeps this method compatible with lightweight test stubs
+        # that construct the handler via object.__new__ without __init__.
+        cached_ref_spk = getattr(self, "_cached_ref_spk", None)
+        cached_ref_rvq = getattr(self, "_cached_ref_rvq", None)
+        cached_ref_spk_emb = getattr(self, "_cached_ref_spk_emb", None)
+        voice_registry = getattr(self, "voice_registry", None)
+        current_voice_name = getattr(self, "_current_voice_name", None)
+
+        if cached_ref_spk is not None:
             # GGML backend: use pre-extracted .spk/.rvq files
-            gen_kwargs["ref_spk"] = self._cached_ref_spk
-            if self._cached_ref_rvq is not None:
-                gen_kwargs["ref_rvq"] = self._cached_ref_rvq
+            gen_kwargs["ref_spk"] = cached_ref_spk
+            if cached_ref_rvq is not None:
+                gen_kwargs["ref_rvq"] = cached_ref_rvq
             gen_kwargs["ref_audio"] = None
             # Use profile ref_text if available (important for ICL mode)
-            if self.voice_registry and self._current_voice_name:
-                profile = self.voice_registry.get(self._current_voice_name)
+            if voice_registry and current_voice_name:
+                profile = voice_registry.get(current_voice_name)
                 if profile and profile.ref_text:
                     gen_kwargs["ref_text"] = profile.ref_text
-            logger.debug("Using cached GGML voice ref: %s", self._cached_ref_spk)
-        elif self._cached_ref_spk_emb is not None:
+            logger.debug("Using cached GGML voice ref: %s", cached_ref_spk)
+        elif cached_ref_spk_emb is not None:
             # Torch backend: use pre-extracted numpy arrays
             import torch
-            spk_emb_tensor = torch.from_numpy(self._cached_ref_spk_emb)
+            spk_emb_tensor = torch.from_numpy(cached_ref_spk_emb)
             voice_clone_prompt = {
                 "ref_spk_embedding": [spk_emb_tensor],
                 "x_vector_only_mode": [True],
@@ -1116,8 +1132,15 @@ class Qwen3TTSHandler(BaseTTSHandler):
             gen_kwargs["ref_audio"] = None
             logger.debug("Using cached Torch voice ref (xvec-only)")
         else:
-            # Fallback to ref_audio path
-            gen_kwargs["ref_audio"] = self.ref_audio
+            # Fallback to setup-provided precomputed references, then ref_audio.
+            ref_spk = getattr(self, "ref_spk", None)
+            ref_rvq = getattr(self, "ref_rvq", None)
+            if ref_spk is not None or ref_rvq is not None:
+                gen_kwargs["ref_spk"] = ref_spk
+                gen_kwargs["ref_rvq"] = ref_rvq
+                gen_kwargs["ref_audio"] = None
+            else:
+                gen_kwargs["ref_audio"] = self.ref_audio
 
         yield from self._stream(
             self.model.generate_voice_clone_streaming(**gen_kwargs),
@@ -1211,8 +1234,9 @@ class Qwen3TTSHandler(BaseTTSHandler):
         self._cached_ref_spk_emb = None
         self._cached_ref_codes = None
         # Re-apply default voice if registry loaded
-        if self.voice_registry is not None:
-            default = self.voice_registry.get_default()
+        voice_registry = getattr(self, "voice_registry", None)
+        if voice_registry is not None:
+            default = voice_registry.get_default()
             if default:
                 self._apply_voice_profile(default)
         logger.debug("Qwen3-TTS session state reset")
