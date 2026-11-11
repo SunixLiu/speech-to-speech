@@ -28,6 +28,31 @@ This pipeline runs in production as the conversation backend for thousands of [R
   </picture>
 </p>
 
+## Fork enhancements (this fork only)
+
+> The following are **additions in this fork** (`feature/mcp-support`), on top of the upstream release. They are not part of the official `speech-to-speech` package. All three require an LLM backend that supports tool/function calling (e.g. `chat-completions` or `responses`).
+
+### Server-side MCP tool execution
+Run general (MCP) tool calls **on the server**, with automatic follow-up generation:
+
+```bash
+speech-to-speech serve --mcp_config path/to/mcp_config.json
+```
+
+`--mcp_config` points to a JSON file describing the MCP servers/tools to expose. When the LLM requests one, the server executes it and feeds the result back into the conversation.
+
+### Dynamic voice switching
+Register TTS voices in a YAML registry and let the LLM switch between them at runtime via two built-in tools (`list_voices`, `switch_voice`):
+
+```bash
+speech-to-speech serve --qwen3_tts_voice_registry_config path/to/voices.yaml
+```
+
+When the user asks to change voice/tone/speaker, the LLM calls `switch_voice(name=...)`; the server applies the registered profile to the Qwen3-TTS handler for the rest of the session.
+
+### Qwen3-TTS torch backend by default
+This fork sets `--qwen3_tts_backend` to `torch` by default (the upstream release default is `ggml`). Override with `--qwen3_tts_backend ggml` if you prefer the GGML backend.
+
 ## Quickstart
 
 Use CPython 3.11–3.14 (3.11 recommended):

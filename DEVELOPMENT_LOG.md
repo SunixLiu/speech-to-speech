@@ -51,3 +51,9 @@
 - **根因**：`s2s_pipeline._stt_session_languages()` 把 `paraformer` 归入「返回空集合 `set()`」的一组；`api/openai_realtime/handlers/session.py` 用 `stt_supported_languages` 校验时，`set()` 非 None 且 `'zh' not in set()` → 拒绝一切语言。但 paraformer-zh 本身支持中文。
 - **改动**：`_stt_session_languages` 为 `paraformer` 单独返回其配置语言 `{handler.language}`（默认 `zh`），其余后端保持原逻辑。
 - **验证**：单元测试 `_stt_session_languages(paraformer, handler.language='zh') -> {'zh'}`，`'zh' in {'zh'}` 通过；TTS 侧 `QWEN3_LANGUAGE_ALIASES` 含 `zh`，故 TTS 校验也通过。
+
+### 新增参数参考文档
+- **改动**：新增 `NEW_PARAMS.md`，记录 v1.0.0→v1.1.0（64 个新参数 + 9 个新后端参数文件）及 v1.1.0→HEAD（15 个，含本地分支）的新增/移除 CLI 参数清单。纯文档，无源码改动。
+
+### README 增加「本 fork 增强」章节
+- **改动**：在 `README.md` 介绍之后、Quickstart 之前新增 "Fork enhancements (this fork only)" 一节，说明本 fork（feature/mcp-support）相对 upstream 的三项增强：服务端 MCP 工具执行（`--mcp_config`）、动态音色切换（`--qwen3_tts_voice_registry_config`）、Qwen3-TTS 默认 torch 后端。纯文档改动。
