@@ -89,7 +89,7 @@ class TestVoiceToolExecution:
             arguments=json.dumps({"name": "trump-speech-2"}),
         )
         chat._pending_tool_calls["call_switch"] = fc
-        chat._ordered_pending_call_ids.add("call_switch")
+        chat._ordered_pending_calls.setdefault("call_switch", set())
 
         executed = handler._handle_voice_tool_calls(
             tools=[tool_call],
@@ -130,7 +130,7 @@ class TestVoiceToolExecution:
             arguments=json.dumps({"name": "trump-speech-2"}),
         )
         chat._pending_tool_calls["call_switch"] = fc
-        chat._ordered_pending_call_ids.add("call_switch")
+        chat._ordered_pending_calls.setdefault("call_switch", set())
 
         tool_call = _tool_call()
         handler._handle_voice_tool_calls(

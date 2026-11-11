@@ -49,6 +49,7 @@ from openai.types.realtime.conversation_item import (
     RealtimeConversationItemUserMessage,
 )
 
+from speech_to_speech.TTS.voice_tools import VoiceToolExecutor
 from speech_to_speech.api.openai_realtime.service import (
     CHUNK_SIZE_BYTES,
     RealtimeService,
@@ -6220,7 +6221,7 @@ class TestServerToolInjection:
         return RealtimeService(
             text_prompt_queue=text_prompt_queue,
             should_listen=should_listen,
-            voice_tool_executor=object(),
+            voice_tool_executor=VoiceToolExecutor(),
             tools=[self.MCP_TOOL],
             tool_executor=lambda name, args: "ok",
             tool_executor_names={"mcp_weather_get_weather"},
