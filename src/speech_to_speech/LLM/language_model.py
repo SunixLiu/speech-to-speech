@@ -757,8 +757,15 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     ctx.tools, original_chat, runtime_config, response,
                 )
 
-            # If voice tool was executed, trigger follow-up generation
-            if voice_tool_executed and turn_output_allowed:
+            # Execute general tool calls (e.g., MCP tools) server-side
+            general_tool_executed = False
+            if commit_allowed and ctx.tools:
+                general_tool_executed = self._handle_tool_calls(
+                    ctx.tools, original_chat, runtime_config, response,
+                )
+
+            # If any tool was executed, trigger follow-up generation
+            if (voice_tool_executed or general_tool_executed) and turn_output_allowed:
                 logger.info("Voice tool executed; triggering follow-up generation")
                 try:
                     for chunk in self._generate(

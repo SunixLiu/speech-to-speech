@@ -5250,3 +5250,92 @@ class TestChatToolCallTracking:
 
         chat.append_tool_output("call_z", self._fco("call_z"))
         assert chat._has_call_id_in_buffer("call_z")
+
+
+# ===================================================================
+# Server-side tool injection across client session.update
+# ===================================================================
+
+
+class TestServerToolInjection:
+    """Server-injected tools (voice + MCP) must survive a client
+    ``session.update`` that replaces the session ``tools`` list.
+
+    The client (e.g. reachy_mini_conversation_app) sends its own robot
+    tools via ``session.update`` on connect. ``_apply_update`` replaces
+    the tools list wholesale, so the server must re-merge its own tools
+    afterwards — otherwise MCP tools (e.g. weather) silently disappear
+    from the LLM request.
+    """
+
+    MCP_TOOL = {
+        "type": "function",
+        "name": "mcp_weather_get_weather",
+        "description": "Get the weather",
+        "parameters": {"type": "object", "properties": {}},
+    }
+    CLIENT_TOOL = {
+        "type": "function",
+        "name": "head_tracking",
+        "description": "Follow the user",
+        "parameters": {"type": "object", "properties": {}},
+    }
+
+    def _service_with_server_tools(self, text_prompt_queue, should_listen):
+        return RealtimeService(
+            text_prompt_queue=text_prompt_queue,
+            should_listen=should_listen,
+            voice_tool_executor=object(),
+            tools=[self.MCP_TOOL],
+            tool_executor=lambda name, args: "ok",
+            tool_executor_names={"mcp_weather_get_weather"},
+        )
+
+    @staticmethod
+    def _tool_names(session) -> list[str]:
+        return [getattr(t, "name", None) or t.get("name") for t in (session.tools or [])]
+
+    def test_register_injects_voice_and_mcp_tools(self, text_prompt_queue, should_listen):
+        service = self._service_with_server_tools(text_prompt_queue, should_listen)
+        sid = service.register()
+        names = self._tool_names(service._state(sid).runtime_config.session)
+        assert "mcp_weather_get_weather" in names
+        assert "switch_voice" in names
+        service.unregister(sid)
+
+    def test_session_update_with_client_tools_preserves_server_tools(
+        self, text_prompt_queue, should_listen
+    ):
+        service = self._service_with_server_tools(text_prompt_queue, should_listen)
+        sid = service.register()
+        service.handle_session_update(
+            sid,
+            SessionUpdateEvent(
+                type="session.update",
+                session={"type": "realtime", "tools": [self.CLIENT_TOOL]},  # type: ignore[arg-type]
+            ),
+        )
+        names = self._tool_names(service._state(sid).runtime_config.session)
+        assert "head_tracking" in names
+        assert "mcp_weather_get_weather" in names
+        assert "switch_voice" in names
+        service.unregister(sid)
+
+    def test_repeated_session_update_does_not_duplicate_server_tools(
+        self, text_prompt_queue, should_listen
+    ):
+        service = self._service_with_server_tools(text_prompt_queue, should_listen)
+        sid = service.register()
+        for _ in range(2):
+            service.handle_session_update(
+                sid,
+                SessionUpdateEvent(
+                    type="session.update",
+                    session={"type": "realtime", "tools": [self.CLIENT_TOOL]},  # type: ignore[arg-type]
+                ),
+            )
+        names = self._tool_names(service._state(sid).runtime_config.session)
+        assert names.count("mcp_weather_get_weather") == 1
+        assert names.count("switch_voice") == 1
+        assert names.count("head_tracking") == 1
+        service.unregister(sid)

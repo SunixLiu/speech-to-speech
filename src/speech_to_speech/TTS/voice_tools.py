@@ -51,13 +51,41 @@ SWITCH_VOICE_TOOL = FunctionTool(
 )
 
 
-def build_voice_tools() -> list[dict[str, object]]:
+def _switch_voice_description(registry: Optional[VoiceRegistry] = None) -> str:
+    """Build the switch_voice description, listing registered voices when known.
+
+    Listing the voices (display name -> exact name) lets the LLM map a user
+    request like "switch to Indian English" to the exact registered name and
+    call the tool directly, instead of guessing whether the voice exists and
+    refusing to switch.
+    """
+    base = (
+        "Switch the TTS voice to a different registered voice. Use this when the "
+        "user asks to change voice, tone, or speaker."
+    )
+    if registry is None:
+        return base
+    voices = registry.list_voices()
+    if not voices:
+        return base
+    lines = [f"- {v.display_name} -> {v.name}" for v in voices]
+    return (
+        base
+        + " Available voices (pass the exact name after '->' as the 'name' argument):\n"
+        + "\n".join(lines)
+    )
+
+
+def build_voice_tools(registry: Optional[VoiceRegistry] = None) -> list[dict[str, object]]:
     """Build the list of voice-related tools as TypedDict-compatible dicts.
 
     Must return plain dicts (not Pydantic models) because the OpenAI SDK's
     responses.create() serializes TypedDict inputs correctly but may drop
     fields from BaseModel instances that inherit from RealtimeFunctionTool,
     resulting in empty 'type' fields that local LLM servers reject.
+
+    Pass *registry* to embed the list of registered voices in the switch_voice
+    description so the LLM knows the exact voice names it may request.
     """
     return [
         {
@@ -69,7 +97,7 @@ def build_voice_tools() -> list[dict[str, object]]:
         {
             "type": "function",
             "name": SWITCH_VOICE_TOOL.name,
-            "description": SWITCH_VOICE_TOOL.description,
+            "description": _switch_voice_description(registry),
             "parameters": SWITCH_VOICE_TOOL.parameters,
         },
     ]

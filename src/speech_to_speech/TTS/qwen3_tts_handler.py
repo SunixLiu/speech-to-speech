@@ -571,15 +571,10 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             self._clear_cached_voice_reference()
             return
 
-        # Check voice registry for named voice match
+        # Check voice registry for named voice match (exact, then case-insensitive
+        # name or display name)
         if self.voice_registry is not None:
-            profile = self.voice_registry.get(session_voice)
-            if profile is None:
-                # Try case-insensitive match
-                for name, p in self.voice_registry.voices.items():
-                    if p.name.lower() == session_voice.lower() or p.display_name.lower() == session_voice.lower():
-                        profile = p
-                        break
+            profile = self.voice_registry.resolve(session_voice)
             if profile is not None:
                 self._apply_voice_profile(profile)
                 return
@@ -640,7 +635,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             logger.warning("No voice registry loaded")
             return "Error: no voice registry loaded"
 
-        profile = self.voice_registry.get(voice_name)
+        profile = self.voice_registry.resolve(voice_name)
         if profile is None:
             available = self.voice_registry.list_names()
             logger.warning("Voice %r not found. Available: %s", voice_name, ", ".join(available))

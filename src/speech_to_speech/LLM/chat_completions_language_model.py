@@ -171,6 +171,12 @@ def _request_chat_completions(
     create_kwargs = dict(optional_kwargs)
     if stream:
         create_kwargs["stream_options"] = {"include_usage": True}
+    tool_names = [
+        t["function"]["name"]
+        for t in create_kwargs.get("tools") or []
+        if isinstance(t, dict) and isinstance(t.get("function"), dict)
+    ]
+    logger.info("Chat completions request tools: %s", tool_names or "(none)")
     return client.chat.completions.create(
         model=model_name,
         messages=messages,

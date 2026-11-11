@@ -909,8 +909,15 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     state.tools, original_chat, turn.runtime_config, turn.response,
                 )
 
-            # If voice tool was executed, trigger follow-up generation
-            if voice_tool_executed and not self._generation_is_stale(turn.gen) and self._turn_output_allowed(turn.turn_id, turn.turn_revision):
+            # Execute general tool calls (e.g., MCP tools) server-side
+            general_tool_executed = False
+            if state.tools:
+                general_tool_executed = self._handle_tool_calls(
+                    state.tools, original_chat, turn.runtime_config, turn.response,
+                )
+
+            # If any tool was executed, trigger follow-up generation
+            if (voice_tool_executed or general_tool_executed) and not self._generation_is_stale(turn.gen) and self._turn_output_allowed(turn.turn_id, turn.turn_revision):
                 logger.info("Voice tool executed; triggering follow-up generation")
                 try:
                     # Build optional_kwargs without tools for follow-up generation to prevent

@@ -1,5 +1,6 @@
 
 # ================= 动态修复 torchaudio.backend 缺失补丁 =================
+import asyncio
 import sys
 import types
 import torchaudio
@@ -509,7 +510,7 @@ def _setup_voice_tools_on_config(
     registry = load_registry(registry_path)
 
     # Build tools and inject into session config
-    voice_tools = build_voice_tools()
+    voice_tools = build_voice_tools(registry)
     existing_tools = runtime_config.session.tools or []
     runtime_config.session.tools = existing_tools + voice_tools
     logger.info("Injected %d voice tool(s) into session config", len(voice_tools))
@@ -543,6 +544,9 @@ def _build_pipeline_unit(
     stt_backend: BackendSelection,
     llm_backend: BackendSelection,
     tts_backend: BackendSelection,
+    tools: list[dict[str, Any]] | None = None,
+    tool_executor=None,
+    tool_executor_names: set[str] | None = None,
 ) -> "PipelineUnit":
     """Build one isolated pipeline with its own state and queues.
 
@@ -586,6 +590,9 @@ def _build_pipeline_unit(
         speculative_turns=speculative_turns,
         voice_tool_executor=voice_executor,
         default_instructions=default_instructions,
+        tools=tools,
+        tool_executor=tool_executor,
+        tool_executor_names=tool_executor_names,
     )
 
     if module_kwargs.enable_live_transcription and not stt_selection.spec.capabilities.streams_audio_chunks:
@@ -654,6 +661,27 @@ def build_pipeline(
     from speech_to_speech.api.openai_realtime.server import RealtimeServer
 
     module_kwargs = args.module_kwargs
+
+    # Initialize MCP manager if configured
+    mcp_manager = None
+    mcp_tools = []
+    mcp_executor = None
+    mcp_tool_names: set[str] | None = None
+    if module_kwargs.mcp_config:
+        from speech_to_speech.mcp_manager import MCPManager
+
+        mcp_manager = MCPManager(module_kwargs.mcp_config)
+        mcp_manager.load_config()
+        # The manager owns a dedicated long-lived event loop; the MCP sessions
+        # are bound to it, so all later tool calls must run on the same loop.
+        mcp_manager.initialize_sync()
+
+        mcp_tools = mcp_manager.get_tools()
+        mcp_executor = mcp_manager.execute_tool_sync
+        # Only these (prefixed) names may be routed to the MCP executor; every
+        # other tool call is left for the client to execute.
+        mcp_tool_names = set(mcp_manager.tool_to_server.keys())
+
     pool = [
         _build_pipeline_unit(
             index=index,
@@ -663,6 +691,9 @@ def build_pipeline(
             stt_backend=args.stt_backend,
             llm_backend=args.llm_backend,
             tts_backend=args.tts_backend,
+            tools=mcp_tools,
+            tool_executor=mcp_executor,
+            tool_executor_names=mcp_tool_names,
         )
         for index in range(module_kwargs.num_pipelines)
     ]
@@ -709,38 +740,27 @@ def build_local_pipeline(args: ParsedArguments, stop_event: Event) -> ThreadMana
 
         mcp_manager = MCPManager(args.module_kwargs.mcp_config)
         mcp_manager.load_config()
-        # Initialize MCP manager in a new event loop
-        import asyncio
-
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(mcp_manager.initialize())
-        finally:
-            loop.close()
+        # The manager owns a dedicated long-lived event loop; the MCP sessions
+        # are bound to it, so all later tool calls must run on the same loop.
+        mcp_manager.initialize_sync()
 
         # Merge MCP tools with existing tools
         mcp_tools = mcp_manager.get_tools()
         tools = tools + mcp_tools
 
-        # Create combined tool executor
+        # Create combined tool executor (the audio client requires an async executor)
         existing_executor = tool_executor
 
         async def combined_executor(name: str, arguments: dict[str, Any]) -> Any:
             if name in mcp_manager.tool_to_server:
-                return await mcp_manager.execute_tool(name, arguments)
+                # execute_tool_sync blocks on the manager's dedicated loop; run it
+                # in a worker thread so the client's event loop stays responsive.
+                return await asyncio.to_thread(mcp_manager.execute_tool_sync, name, arguments)
             if existing_executor:
                 return await existing_executor(name, arguments)
             raise ValueError(f"Unknown tool: {name}")
 
-        # Wrap async executor for sync use
-        def sync_combined_executor(name: str, arguments: dict[str, Any]) -> Any:
-            loop = asyncio.new_event_loop()
-            try:
-                return loop.run_until_complete(combined_executor(name, arguments))
-            finally:
-                loop.close()
-
-        tool_executor = sync_combined_executor
+        tool_executor = combined_executor
 
     server_manager = build_pipeline(args, stop_event, host="127.0.0.1")
     client = RealtimeAudioClient(

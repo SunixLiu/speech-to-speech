@@ -80,6 +80,26 @@ class VoiceRegistry:
     def get(self, name: str) -> Optional[VoiceProfile]:
         return self.voices.get(name)
 
+    def resolve(self, name: str) -> Optional[VoiceProfile]:
+        """Resolve a voice by exact name, then case-insensitive name, then
+        case-insensitive display name.
+
+        LLMs frequently pass a display name (e.g. ``Indian-English``) or a
+        differently-cased variant instead of the exact registered name
+        (``Indian-english``); matching those keeps voice switching robust.
+        Returns ``None`` if nothing matches.
+        """
+        if not name:
+            return None
+        profile = self.voices.get(name)
+        if profile is not None:
+            return profile
+        name_lower = name.lower()
+        for p in self.voices.values():
+            if p.name.lower() == name_lower or p.display_name.lower() == name_lower:
+                return p
+        return None
+
     def get_default(self) -> Optional[VoiceProfile]:
         if self.default_voice and self.default_voice in self.voices:
             return self.voices[self.default_voice]

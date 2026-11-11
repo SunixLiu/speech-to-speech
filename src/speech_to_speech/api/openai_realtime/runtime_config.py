@@ -50,6 +50,18 @@ class RuntimeConfig(BaseModel):
         default=None,
         description="Server-side executor for voice tool calls.",
     )
+    tool_executor: Optional[Any] = Field(
+        default=None,
+        description="Server-side executor for general (e.g. MCP) tool calls.",
+    )
+    tool_executor_names: Optional[set[str]] = Field(
+        default=None,
+        description=(
+            "Names of the tools that tool_executor can handle. Tool calls with any "
+            "other name are left for the client to execute. None means the executor "
+            "handles every tool (legacy behaviour)."
+        ),
+    )
 
     @field_validator("session", mode="after")
     @classmethod

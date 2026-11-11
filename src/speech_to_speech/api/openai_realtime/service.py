@@ -306,6 +306,9 @@ class RealtimeService:
         speculative_turns: SpeculativeTurnTracker | None = None,
         voice_tool_executor=None,
         default_instructions: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_executor=None,
+        tool_executor_names: set[str] | None = None,
     ) -> None:
         self.text_prompt_queue = text_prompt_queue
         self.should_listen = should_listen
@@ -313,6 +316,9 @@ class RealtimeService:
         self.speculative_turns = speculative_turns
         self._voice_tool_executor = voice_tool_executor
         self._default_instructions = default_instructions
+        self._tools = tools or []
+        self._tool_executor = tool_executor
+        self._tool_executor_names = tool_executor_names
         self._conns: dict[str, ConnState] = {}
         self.total_usage = GlobalUsageMetrics()
 
@@ -335,6 +341,32 @@ class RealtimeService:
 
     # ── Connection lifecycle ─────────────────────
 
+    def _merge_server_tools(self, rc: RuntimeConfig) -> None:
+        """Merge server-side tools (voice + MCP) into the session config.
+
+        Clients send their own tools via ``session.update``, and
+        :meth:`RuntimeConfig.apply_session_update` replaces the tools list
+        wholesale — so the server's own tools must be re-merged after every
+        such update, or they silently disappear from the LLM request.
+        Deduplicated by name, so repeated updates never duplicate them.
+        """
+        server_tools: list[dict[str, Any]] = []
+        if self._voice_tool_executor is not None:
+            server_tools.extend(build_voice_tools(self._voice_tool_executor.registry))
+        server_tools.extend(self._tools)
+        if not server_tools:
+            return
+        existing = rc.session.tools or []
+        existing_names = {getattr(t, "name", None) or (t.get("name") if isinstance(t, dict) else None) for t in existing}
+        additions = [t for t in server_tools if t["name"] not in existing_names]
+        if additions:
+            rc.session.tools = [*existing, *additions]
+            logger.info(
+                "Merged %d server tool(s) into session config: %s",
+                len(additions),
+                [t["name"] for t in additions],
+            )
+
     def register(self) -> str:
         """Register a new connection and return its session_id."""
         if self.speculative_turns:
@@ -348,11 +380,14 @@ class RealtimeService:
         )
         if self._voice_tool_executor is not None:
             rc.voice_tool_executor = self._voice_tool_executor
-            # Also inject voice tools into session config for this connection
-            voice_tools = build_voice_tools()
-            existing_tools = rc.session.tools or []
-            rc.session.tools = existing_tools + voice_tools
-            logger.info("Injected %d voice tool(s) into session config for new connection", len(voice_tools))
+        self._merge_server_tools(rc)
+        if self._tool_executor is not None:
+            # Attach the executor so the LLM handler can run tool calls
+            # server-side and trigger follow-up generation. The name set keeps
+            # the LLM handler from routing tools the executor cannot handle
+            # (e.g. local tool-module tools) to it.
+            rc.tool_executor = self._tool_executor
+            rc.tool_executor_names = self._tool_executor_names
         rc.session.tool_choice = "auto"
         state = ConnState(runtime_config=rc)
         self._conns[state.session_id] = state

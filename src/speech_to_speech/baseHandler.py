@@ -252,6 +252,88 @@ class BaseHandler(Generic[InT, OutT]):
 
         return executed
 
+    def _handle_tool_calls(
+        self,
+        tools,
+        original_chat,
+        runtime_config,
+        response=None,
+    ) -> bool:
+        """Execute tool calls server-side and inject results into chat.
+
+        Only tools whose names are in ``runtime_config.tool_executor_names``
+        are executed here; every other tool call (local tool-module tools,
+        voice tools) is left for the client / voice handler to execute. When
+        the set is None the executor is tried for every tool (legacy behaviour
+        for custom executors that handle all declared tools).
+
+        Returns True if any tool was executed."""
+        if not runtime_config or not getattr(runtime_config, "tool_executor", None):
+            return False
+
+        executor = runtime_config.tool_executor
+        known_names = getattr(runtime_config, "tool_executor_names", None)
+        executed = False
+
+        for tool_call in tools:
+            tool_name = getattr(tool_call, "name", None)
+            if not tool_name:
+                continue
+            if known_names is not None and tool_name not in known_names:
+                logger.debug(
+                    "Skipping tool '%s' server-side (not handled by tool_executor); leaving it to the client",
+                    tool_name,
+                )
+                continue
+
+            try:
+                args = json.loads(tool_call.arguments) if getattr(tool_call, "arguments", None) else {}
+            except Exception:
+                args = {}
+
+            try:
+                result = executor(tool_name, args)
+                if not isinstance(result, str):
+                    result = json.dumps(result)
+            except Exception as e:
+                result = "Error executing " + tool_name + ": " + str(e)
+                logger.warning("Tool execution failed: " + str(e), exc_info=True)
+
+            from openai.types.realtime import RealtimeConversationItemFunctionCallOutput
+
+            output_item = RealtimeConversationItemFunctionCallOutput(
+                call_id=tool_call.call_id,
+                output=result,
+                type="function_call_output",
+                id=tool_call.id,
+                status="completed",
+            )
+            original_chat.append_tool_output(tool_call.call_id, output_item)
+
+            # Remove any re-injected function_call from buffer to prevent
+            # it from contaminating the follow-up generation.
+            from openai.types.realtime import RealtimeConversationItemFunctionCall
+
+            for item in list(original_chat.buffer):
+                if (
+                    isinstance(item, RealtimeConversationItemFunctionCall)
+                    and item.call_id == tool_call.call_id
+                ):
+                    original_chat.buffer.remove(item)
+                    logger.debug(
+                        'Removed re-injected function_call for call_id=%s',
+                        tool_call.call_id,
+                    )
+                    break
+
+            logger.info(
+                "Tool executed server-side: %s -> %s",
+                tool_name, str(result)[:100],
+            )
+            executed = True
+
+        return executed
+
     def cleanup(self) -> None:
         pass
 

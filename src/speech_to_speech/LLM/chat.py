@@ -174,6 +174,18 @@ class Chat:
                 return True
         return False
 
+    def _has_output_in_buffer(self, call_id: str) -> bool:
+        """Whether a ``function_call_output`` for *call_id* is already in the buffer.
+
+        True after the call was answered server-side (MCP / voice tools), where
+        the paired ``function_call`` may already have been removed from the
+        buffer — so :meth:`_has_call_id_in_buffer` alone cannot detect it.
+        """
+        for entry in self.buffer:
+            if isinstance(entry, RealtimeConversationItemFunctionCallOutput) and entry.call_id == call_id:
+                return True
+        return False
+
     def _mark_call_completed(
         self, call_id: str, status: Literal["completed", "incomplete", "in_progress"] | None = None
     ) -> None:
@@ -210,6 +222,14 @@ class Chat:
             fc.status = "completed" if output_item.status is None else output_item.status
             self.buffer.append(fc)
             self.buffer.append(output_item)
+            return
+
+        if self._has_output_in_buffer(call_id):
+            # Already answered (server-side MCP / voice tool execution). A late
+            # client output for the same call_id — e.g. the audio client's
+            # "unknown tool" error for a server-handled call — must not
+            # duplicate the result or raise.
+            logger.debug("Ignoring duplicate function_call_output for call_id=%s (already answered)", call_id)
             return
 
         raise ChatItemError(f"No function_call with call_id '{call_id}' found in conversation history.")
