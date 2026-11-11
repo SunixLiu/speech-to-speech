@@ -609,7 +609,12 @@ def _stt_session_languages(selection: BackendSelection, handler: Any) -> set[str
         return set() if getattr(generation_config, "is_multilingual", None) is False else None
     if selection.name == "qwen3-asr":
         return set(modules[type(handler).__module__].SUPPORTED_LANGUAGES)
-    if selection.name in {"parakeet-tdt", "parakeet-unified", "paraformer", "openai-realtime", "vllm-realtime"}:
+    if selection.name == "paraformer":
+        # Paraformer is a fixed-language backend (default Chinese); declare the
+        # language it was configured for so the realtime session accepts it.
+        lang = getattr(handler, "language", None)
+        return {lang} if lang else {"zh"}
+    if selection.name in {"parakeet-tdt", "parakeet-unified", "openai-realtime", "vllm-realtime"}:
         return set()
     return None
 

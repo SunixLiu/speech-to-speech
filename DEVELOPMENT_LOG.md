@@ -32,4 +32,22 @@
      - `src/speech_to_speech/config.py`：本地新增的 `mcp_config` 字段未登记进 `_MODULE_PIPELINE`，upstream 新配置清单测试断言集合相等 → 加入该集合。
      - `tests/test_cli_defaults.py`：upstream 新测试断言发布默认 `qwen3_tts_backend == "ggml"`，与本地有意改为 torch 的默认冲突 → 按本地意图更新断言并加注释。
   3. **环境/其他（少量）**：`test_demo_user_audio`（Windows GBK locale 读 UTF-8 HTML）、`test_speculative_turns` 一条时间边界断言（0.8s 临界，慢机器 flaky）、`test_weather_server::test_chinese_city_name_resolves`（真实 HTTP 调用同样触发 httpx 环境 bug）。
+
+### venv 依赖修复（serve 的 TTS 阶段）
+- **背景**：`serve` 依次卡在 STT→TTS。STT 缺 funasr（已装 funasr 1.4.24 + modelscope 1.40.3）。TTS 阶段连续暴露多个 `.venv` 依赖问题，逐一修复（均为环境改动，非源码）。
+- **改动**：
+  1. torch 由 CPU 版换成 CUDA 版 `torch 2.6.0+cu126`（本地缓存 `D:\download\whl` 有 cp312 wheel）。
+  2. torchaudio 对齐到 `2.6.0+cu126`。本地缓存只有 cp310/cp39，cp312 需从官方索引下载：`pip install "torchaudio==2.6.0" --index-url https://download.pytorch.org/whl/cu126`。**torch/torchaudio 版本必须一致**，否则 `_torchaudio` 扩展加载报 `OSError: [WinError 127]`。
+  3. `qwen-tts-hf 0.1.1.post1` 安装不完整（`qwen_tts/` 只剩 `_transformers_compat.py`，缺 `__init__.py`/modeling 等共 37 个文件）→ `pip install --force-reinstall --no-deps "qwen-tts-hf==0.1.1.post1"` 补回。
+  4. 修复一次被中断的重装进程顺带升级的包：numpy 2.5.4→**2.4.3**（numba 需 ≤2.4）、llvmlite 0.50.0→**0.48.0**（numba 0.66.0 需 <0.49）、pydantic-core 2.50.4→**2.47.0**（pydantic 2.14.0a1 需 ==2.47.0）、sympy 1.14.0→**1.13.1**（torch 2.6.0 需 ==1.13.1）。
+- **验证**：`pip check` 无冲突；`import speech_to_speech.s2s_pipeline`、`from qwen_tts import Qwen3TTSModel` 均通过；`torch.cuda.is_available()==True`。
+- **注意**：
+  - 重装本项目依赖（如 `pip install -e ".[paraformer]"`）会重新解析 torch，可能把 CUDA 版换回 CPU 版或打乱版本；重装本项目本身建议加 `--no-deps`，装完确认 torch 仍是 `+cu126`。
+  - flash-attn 未安装，Qwen3-TTS 走手动 PyTorch 路径（仅警告，不影响功能）。
 - **修复后**：上述集成问题对应的测试文件全部通过（qwen3 后端 70/70、realtime service 286/286、voice_switching / cli_defaults / config / weather 除真实网络用例外全过）。剩余失败均为第 1、3 类环境问题。
+
+### paraformer STT 语言校验修复（realtime 前端报 "Language 'zh' is not supported"）
+- **现象**：前端 `reachy_mini_conversation_app` 连 speech-to-speech realtime，session.update 带 `language='zh'`，服务端报 `Language 'zh' is not supported by the active STT backend.`。
+- **根因**：`s2s_pipeline._stt_session_languages()` 把 `paraformer` 归入「返回空集合 `set()`」的一组；`api/openai_realtime/handlers/session.py` 用 `stt_supported_languages` 校验时，`set()` 非 None 且 `'zh' not in set()` → 拒绝一切语言。但 paraformer-zh 本身支持中文。
+- **改动**：`_stt_session_languages` 为 `paraformer` 单独返回其配置语言 `{handler.language}`（默认 `zh`），其余后端保持原逻辑。
+- **验证**：单元测试 `_stt_session_languages(paraformer, handler.language='zh') -> {'zh'}`，`'zh' in {'zh'}` 通过；TTS 侧 `QWEN3_LANGUAGE_ALIASES` 含 `zh`，故 TTS 校验也通过。
