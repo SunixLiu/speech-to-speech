@@ -44,6 +44,7 @@ _MODULE_PIPELINE = {
     "enable_visemes",
     "stv_model_name",
     "stv_device",
+    "mcp_config",
 }
 _PATH_FIELDS = {
     "vad_firered_model_dir",

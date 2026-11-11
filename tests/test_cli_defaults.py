@@ -67,7 +67,9 @@ def test_release_defaults_match_local_qwen35_parakeet_qwen3_profile():
     assert qwen3_args.qwen3_tts_model_name == "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     assert qwen3_args.qwen3_tts_speaker == "Aiden"
     assert qwen3_args.qwen3_tts_language == "auto"
-    assert qwen3_args.qwen3_tts_backend == "ggml"
+    # Local fork intentionally defaults to the torch backend (upstream release
+    # default is "ggml"); see DEVELOPMENT_LOG.md.
+    assert qwen3_args.qwen3_tts_backend == "torch"
     assert qwen3_args.qwen3_tts_non_streaming_mode is True
     assert qwen3_args.qwen3_tts_ref_audio is None
     assert qwen3_args.qwen3_tts_ref_spk is None
